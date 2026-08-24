@@ -45,6 +45,16 @@ pub struct BoardRequest {
     pub board_id: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BoardStateRequest {
+    #[schemars(description = "Configured board identifier")]
+    pub board_id: String,
+    #[schemars(description = "Time to collect fresh serial evidence; defaults to 500 ms")]
+    pub observe_duration_ms: Option<u64>,
+    #[schemars(description = "Send Enter to solicit the current console prompt")]
+    pub active_probe: Option<bool>,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct BoardStateResult {
     pub board_id: String,
@@ -176,31 +186,50 @@ impl RpictlServer {
     }
 
     #[tool(
-        description = "Infer current board state from bounded recent serial evidence without writing to the console"
+        description = "Infer board state from serial evidence, optionally sending Enter as a safe active probe"
     )]
     fn get_board_state(
         &self,
-        Parameters(request): Parameters<BoardRequest>,
+        Parameters(request): Parameters<BoardStateRequest>,
     ) -> Result<Json<BoardStateResult>, String> {
         let board = self
             .registry
             .board(&request.board_id)
             .map_err(|error| error.to_string())?;
+        let active_probe = request.active_probe.unwrap_or(false);
+        let observe_duration =
+            std::time::Duration::from_millis(request.observe_duration_ms.unwrap_or(500).min(5_000));
+        let cursor = board
+            .serial
+            .lock()
+            .map_err(|_| "serial buffer lock is poisoned".to_string())?
+            .next_cursor();
+        if active_probe {
+            self.registry
+                .write_console(&request.board_id, b"\r")
+                .map_err(|error| error.to_string())?;
+        }
+        std::thread::sleep(observe_duration);
         let serial = board
             .serial
             .lock()
             .map_err(|_| "serial buffer lock is poisoned".to_string())?;
-        let snapshot = serial.snapshot_generation(serial.generation(), 65_536);
+        let snapshot = if active_probe {
+            serial.snapshot_from(cursor, 65_536)
+        } else {
+            serial.snapshot_generation(serial.generation(), 65_536)
+        };
         let bytes: Vec<u8> = snapshot
             .chunks
             .iter()
             .flat_map(|chunk| chunk.bytes.iter().copied())
             .collect();
-        let evidence = StateDetector::new(&board.profile.patterns).observe(
+        let mut evidence = StateDetector::new(&board.profile.patterns).observe(
             &bytes,
             SystemTime::now(),
             serial.generation(),
         );
+        evidence.active_probe = active_probe;
         Ok(Json(BoardStateResult {
             board_id: request.board_id,
             state: serde_json::to_value(evidence.state)
