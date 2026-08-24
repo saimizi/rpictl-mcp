@@ -10,6 +10,11 @@ being tied to tvisor or any other workload.
 This document defines externally visible requirements. It does not prescribe an
 implementation language, MCP SDK, serial library, or power-controller vendor.
 
+### 1.1 Version status
+
+This revision describes the implemented Rust v0.1 behavior. Statements marked
+"deferred" describe post-v0.1 work rather than current server guarantees.
+
 ## 2. Goals
 
 The server shall:
@@ -18,9 +23,9 @@ The server shall:
 2. Capture bounded serial logs without requiring an interactive terminal.
 3. Detect U-Boot countdowns and prompts, Linux boot progress, login prompts, and
    authenticated Linux shells.
-4. Enter U-Boot and execute policy-authorized U-Boot commands.
-5. Boot Linux, log in with configured credentials, and execute policy-authorized
-   Linux commands.
+4. Enter U-Boot and execute caller-provided one-line U-Boot commands.
+5. Boot Linux, log in with configured credentials, and execute caller-provided
+   one-line Linux commands.
 6. Serialize access to each physical console and prevent interleaved commands.
 7. Return structured, auditable results with useful timeout and failure details.
 8. Support named board profiles so hardware-specific settings are configuration,
@@ -36,10 +41,10 @@ The server shall:
 - Passive and bounded serial capture.
 - Detection of U-Boot, Linux boot, Linux login, and Linux shell states.
 - U-Boot countdown interruption and prompt synchronization.
-- Guarded U-Boot command execution.
-- Linux boot, serial-console login, and guarded command execution.
+- Unrestricted one-line U-Boot command execution over the board console.
+- Linux boot, serial-console login, and unrestricted one-line command execution.
 - Graceful Linux shutdown and forced power control.
-- Per-board locking, operation timeouts, cancellation, and audit records.
+- Per-board locking and bounded operation timeouts.
 
 ### 3.2 Out of scope for the initial release
 
@@ -62,7 +67,7 @@ Every board-facing tool shall take a `board_id`. A board profile shall define:
 - U-Boot prompt, countdown patterns, interrupt bytes, and boot command;
 - Linux boot, login, password, shell-prompt, and shutdown patterns;
 - login account references and credential-provider references;
-- command-policy references;
+- optional legacy command allowlists, accepted but not enforced;
 - timeouts, serial pacing, line endings, and power-cycle off interval.
 
 The current development board can be represented by this example profile:
@@ -90,27 +95,39 @@ These values are deployment data, not mandatory defaults.
 - **Board lease**: exclusive ownership of operations that can write to a board.
 - **Console generation**: serial evidence produced since the latest verified
   power-on, reset, or explicitly recorded generation boundary.
-- **Command policy**: configured allow, confirmation, and deny rules.
+- **Active probe**: a disclosed carriage return sent to solicit the current
+  console prompt when passive evidence is unavailable.
 - **Graceful power-off**: request shutdown through Linux and then verify power.
 - **Forced power-off**: turn off the external power controller immediately.
 
 ## 6. MCP protocol requirements
 
-1. The server shall target the stable MCP `2026-07-28` specification or a
-   documented later stable revision.
+1. The v0.1 server uses `rmcp` 3.1 and negotiates the MCP protocol supported by
+   that SDK (currently verified with `2025-06-18`).
 2. The initial transport shall be `stdio`.
 3. Every tool shall publish complete input and output JSON Schemas.
 4. Results shall contain structured content; human-readable text may be included
    as a concise summary.
-5. Long operations should report progress or use MCP task support when available
-   in the selected SDK.
-6. Cancellation shall stop serial writes and waiting promptly. A power-cycle
-   cleanup that must restore power shall be non-cancellable once power is off.
+5. v0.1 operations are synchronous and bounded by explicit or configured
+   timeouts. MCP task progress and cancellation are deferred.
 
 References:
 
 - [MCP 2026-07-28 release](https://blog.modelcontextprotocol.io/posts/2026-07-28/)
 - [MCP server tools specification](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
+
+### 6.1 Command-line interface
+
+The v0.1 binary provides:
+
+- `rpictl-mcp doctor <config.json>` to validate configuration and report basic
+  serial-device and power-identity readiness;
+- `rpictl-mcp serve <config.json> [monitor-socket]` to start the stdio MCP server
+  and real-time monitor socket; and
+- `rpictl-mcp monitor <board_id> [monitor-socket]` to stream that board's serial
+  bytes without taking ownership of the UART.
+
+The default monitor socket is `/tmp/rpictl-mcp.sock`.
 
 ## 7. Common data model
 
@@ -136,21 +153,25 @@ and whether active probing was used.
 
 ### 7.2 Common operation result
 
-Every operation shall report:
+Every v0.1 operation result reports:
 
 - `operation_id`, `board_id`, and operation name;
 - start and finish timestamps and elapsed time;
-- success/failure and stable error code;
-- initial, expected, and observed final state when applicable;
-- bounded serial transcript with truncation metadata;
+- success/failure;
+- expected and observed state when applicable;
+- bounded command output when the operation completes successfully;
 - actions performed, including recovery actions;
-- policy decision and confirmation status when applicable.
+- a policy-decision label and requested actions when applicable.
+
+Errors are returned as MCP tool errors containing a stable error code, phase,
+and message. A timed-out command does not yet embed its partial transcript;
+callers can retrieve retained bytes with `capture_serial`.
 
 Secrets shall never appear in results.
 
 ### 7.3 Resources
 
-The server should expose read-only MCP resources:
+The following read-only MCP resources are deferred beyond v0.1:
 
 - `rpictl://boards`
 - `rpictl://boards/{board_id}/status`
@@ -164,8 +185,8 @@ The server should expose read-only MCP resources:
 
 #### `list_boards`
 
-Returns configured board IDs, display names, capabilities, availability, and
-current lease status.
+Returns configured board IDs, display names, serial device, power backend,
+availability, and current lease owner when present.
 
 #### `get_board_state`
 
@@ -175,9 +196,11 @@ Inputs:
 - `observe_duration_ms`
 - `active_probe`, default `false`
 
-It shall combine power-backend state and fresh serial evidence. Passive
-observation must not write to the console. Active probing shall be disclosed in
-the result and shall use only profile-approved probe input.
+Passive observation reads the current serial generation without writing.
+`active_probe=true` records a cursor, sends one carriage return, observes fresh
+serial bytes for the requested duration (default 500 ms, capped at 5 seconds),
+and discloses the probe in the result. The caller queries power separately with
+`get_power_state`.
 
 #### `get_power_state`
 
@@ -188,9 +211,11 @@ backend metadata safe for disclosure.
 
 #### `power_on`
 
-Inputs include `board_id` and optional `wait_for`: `none`, `uboot`,
-`linux_login`, or `linux_shell`. The operation shall verify relay state and,
-when requested, wait for fresh console evidence.
+Inputs include `board_id` and optional `wait_for`, using a board-state name such
+as `uboot_countdown`, `uboot_prompt`, `linux_login`, or `linux_shell`. The
+operation verifies relay state. v0.1 callers that need atomic power-on and
+U-Boot entry should immediately call `enter_uboot` after waiting for the fresh
+countdown.
 
 #### `power_off`
 
@@ -208,31 +233,28 @@ as destructive.
 
 #### `power_cycle`
 
-Inputs include `board_id`, `mode`, `reason`, and optional `wait_for`.
-The server shall verify off, wait the configured minimum interval, restore power,
-and verify on. Once power is off, restoration takes priority over cancellation
-and ordinary command failure.
+Inputs include `board_id`, `mode`, `reason`, explicit confirmation, and optional
+`wait_for`. v0.1 validates `mode` and accepts `wait_for`, but power cycling is a
+verified forced off/on sequence and does not yet implement graceful shutdown or
+the requested post-power-on wait. The server verifies off, waits the configured
+minimum interval, restores power, and verifies on. Once power is off, a
+best-effort restoration takes priority over ordinary command failure.
 
 ### 8.3 Serial
 
 #### `capture_serial`
 
-Inputs:
-
-- `board_id`
-- `duration_ms`
-- `max_bytes`
-- optional `stop_patterns`
-- `from`: `now`, `recent`, or a console-generation cursor
-
-The result shall include raw-safe encoded bytes or decoded text, timestamps,
-matched pattern, cursor, and truncation information. Capture shall not write to
-the console or require a board lease.
+Inputs are `board_id`, optional `max_bytes` (default 65536), and an optional
+cursor. The result includes decoded text, start and next cursors, console
+generation, truncation, and invalid-UTF-8 metadata. Capture does not write to
+the console or require a board lease. Timed capture and stop-pattern filtering
+are deferred.
 
 #### `wait_for_state`
 
-Waits for one or more named states with a bounded timeout. It shall return the
-evidence establishing the state rather than only a Boolean.
+Waits for one or more named states with a bounded timeout. v0.1 returns the
+matched state with standard confidence and a current-generation evidence label;
+exact matched bytes and generation reporting are future refinements.
 
 ### 8.4 U-Boot
 
@@ -243,8 +265,9 @@ The tool shall:
 
 1. Return immediately after synchronizing an existing U-Boot prompt.
 2. Interrupt a detected autoboot countdown with configured input.
-3. If restart is permitted and required, perform the configured reset or power
-   cycle and interrupt the next fresh countdown.
+3. With `restart=auto`, reboot from a verified Linux shell when required. With
+   `restart=always`, reset from an existing U-Boot prompt. Both paths interrupt
+   the next fresh countdown atomically.
 4. Verify the prompt before reporting success.
 
 #### `run_uboot_command`
@@ -254,22 +277,21 @@ Inputs:
 - `board_id`
 - one-line `command`
 - `timeout_ms`
-- optional `expected_patterns`
-- `allow_reboot`, default `false`
+- compatibility fields `expected_patterns` and `allow_reboot` (not enforced in
+  v0.1)
 
 The server shall reject control characters and embedded newlines, synchronize
 the prompt, send any caller-provided one-line command,
-verify command echo, capture output, and wait for either the prompt, an expected
-terminal state, or timeout. Prompt-like text in command output shall not alone
-prove completion.
+capture output, and wait for the next detected U-Boot prompt or timeout.
 
 ### 8.5 Linux
 
 #### `boot_linux`
 
-Starts or resumes the profile-defined U-Boot boot path and waits for Linux boot,
-login, or shell evidence. An optional `login` input may request automatic
-serial login after the login prompt appears.
+Sends the profile-defined U-Boot boot command and waits for Linux boot, login,
+or shell evidence. The current board profile uses `reset`. The `login` field is
+accepted, but automatic login within this operation is deferred; callers use
+`linux_login` after a login prompt is observed.
 
 #### `linux_login`
 
@@ -285,19 +307,19 @@ Inputs:
 - `board_id`
 - one-line `command`
 - `timeout_ms`
-- optional `expected_patterns`
-- optional policy-approved `stdin_entries`
+- compatibility fields `expected_patterns` and `allow_reboot` (not enforced in
+  v0.1)
 
-The server shall verify or establish a Linux shell, send any caller-provided
-one-line command, and append a collision-resistant completion marker that
-captures the exit status. The result shall separate command output from echoed
-input and the marker. On timeout it may send configured interrupt input, then
-must resynchronize or mark the console state unknown.
+The caller shall first establish a Linux shell with `linux_login`. The server
+sends any caller-provided one-line command and appends a collision-resistant
+completion marker that captures the exit status. v0.1 returns the bounded raw
+console transaction, including command echo and marker. Nonzero exit and timeout
+are MCP errors; retained serial bytes remain available through `capture_serial`.
 
 #### `reboot_linux`
 
-Runs the configured Linux reboot sequence, observes the old console generation
-ending, and optionally waits for U-Boot or Linux in the new boot generation.
+Requires explicit confirmation, sends `reboot` from the Linux console, marks a
+new console generation, and optionally waits for a named U-Boot or Linux state.
 
 ## 9. Command transport policy
 
@@ -361,10 +383,10 @@ State detection shall:
   lease.
 - Read-only serial captures may coexist with an active operation.
 - Lease acquisition has a bounded timeout and reports the owning operation.
-- Server restart shall reconcile power and serial state rather than trusting
-  cached expected state.
-- Completed operation records and serial buffers shall have configurable
-  retention limits.
+- After restart, passive state begins as `unknown` until new serial evidence is
+  received. Callers may request an active probe to solicit a prompt.
+- Serial ring size is configurable. Persistent completed-operation retention is
+  deferred.
 
 ## 14. Security
 
@@ -377,7 +399,9 @@ State detection shall:
    outside ordinary profile files or protected with appropriate permissions.
 5. Secrets shall be redacted from MCP results, logs, errors, and audit records.
 6. MCP callers shall not supply arbitrary executable paths or power-device IDs.
-7. Destructive operations require explicit, operation-specific confirmation.
+7. Power-off, power-cycle, and Linux reboot tools require explicit confirmation.
+   Arbitrary console command tools intentionally do not classify or restrict
+   caller-provided commands in v0.1.
 
 ## 15. Error model
 
@@ -402,13 +426,15 @@ Stable error codes shall include at least:
 - `RECOVERY_FAILED`
 - `OPERATION_CANCELLED`
 
-Errors shall include the failed phase, safe recovery guidance, observed state,
-and bounded non-secret evidence. Truncation is metadata and need not make an
-otherwise successful operation fail.
+v0.1 errors include the failed phase and message. Structured recovery guidance,
+observed-state attachment, and embedded partial transcripts are deferred.
+Truncation is metadata and does not make a successful capture fail.
 
-## 16. Audit requirements
+## 16. Audit status
 
-Each mutating operation shall create an audit record containing:
+Operation results currently carry IDs, timestamps, actions, state, and command
+output for the connected caller. Persistent append-oriented audit storage is
+deferred. A future audit record should contain:
 
 - operation and board IDs;
 - caller/session identity when available;
@@ -420,7 +446,7 @@ Each mutating operation shall create an audit record containing:
 - result or error code;
 - transcript reference and content hash.
 
-Audit records shall be append-oriented and have configurable retention.
+Future audit records should be append-oriented and have configurable retention.
 
 ## 17. Non-functional requirements
 
@@ -428,13 +454,11 @@ Audit records shall be append-oriented and have configurable retention.
   available.
 - No wait may be unbounded.
 - Default serial transcript and ring-buffer sizes shall be bounded.
-- A transient MCP client disconnect shall not prevent mandatory power
-  restoration.
-- Backend failures shall use bounded retries with backoff.
-- Profiles and policies shall be schema-validated at startup.
-- Unit tests shall use fake serial and power backends.
-- Integration tests shall cover cancellation, stale prompt rejection, policy
-  denial, login failure, timeout recovery, and power restoration.
+- Power-cycle logic makes a best-effort restore-on attempt after power is
+  switched off.
+- Configuration is schema-validated at startup.
+- Unit tests cover configuration, lease behavior, bounded serial buffering,
+  state detection, and stale-generation rejection.
 - Hardware tests shall be opt-in and identify the target board explicitly.
 
 ## 18. Configuration requirements
@@ -444,51 +468,62 @@ Configuration shall be separated into:
 1. board profiles;
 2. serial and state-detection profiles;
 3. power-backend definitions;
-4. U-Boot and Linux command policies;
+4. U-Boot and Linux console settings, including legacy allowlist fields retained
+   for configuration compatibility;
 5. secret-provider references;
 6. retention and audit settings.
 
-Startup shall reject duplicate serial devices, duplicate power identities,
-invalid patterns, unknown policy references, unavailable required backends, and
-profiles that lack safe timeout limits.
+Startup rejects duplicate serial devices, invalid serial settings, unsupported
+power backends, and invalid or incomplete profiles. The `doctor` command reports
+missing serial devices as warnings and confirms profile count, configured power
+identity, and stdio transport.
 
-## 19. Acceptance criteria
+## 19. v0.1 acceptance status
 
-The initial release is acceptable when it can demonstrate:
+The implemented initial release has demonstrated:
 
-1. Listing and independently locking at least two simulated board profiles.
-2. Querying, turning on, turning off, and cycling a fake and one real power
-   backend with identity verification.
+1. Listing configured boards and exclusively leasing write operations per board.
+2. Querying, turning on, gracefully or forcibly turning off, and cycling the
+   configured real Matter power backend with identity verification.
 3. Capturing bounded serial output without writing to the device.
 4. Detecting U-Boot countdown and reaching a verified U-Boot prompt.
-5. Running an allowed U-Boot command and returning its bounded output.
-6. Denying a persistent or destructive U-Boot command by default.
+5. Running any caller-provided one-line U-Boot command and returning bounded
+   serial output.
+6. Rejecting multiline and control-character input that would break transport
+   framing.
 7. Detecting Linux boot and login prompts from fresh serial evidence.
 8. Logging in using a configured credential without disclosing it.
-9. Running an allowed Linux command and returning its true exit status.
-10. Requiring confirmation for a configured high-risk Linux command.
-11. Rejecting stale U-Boot and Linux prompts after reset or power cycle.
-12. Restoring power after cancellation or failure during a power cycle.
-13. Keeping concurrent read-only capture usable while serial writes remain
+9. Running any caller-provided one-line Linux command with a completion marker.
+10. Requiring confirmation for explicit power and Linux-reboot tools.
+11. Rejecting stale U-Boot and Linux prompts after a generation boundary.
+12. Making a best-effort restoration after failure during a power cycle.
+13. Keeping read-only capture usable while serial writes remain
     exclusive.
-14. Producing a complete redacted audit record for every mutating operation.
+14. Detecting U-Boot, Linux login, and Linux shell states after server restart
+    using the disclosed Enter-based active probe.
 
-## 20. Suggested delivery phases
+MCP resources, task/cancellation support, persistent audit storage, automatic
+unknown-state recovery, and richer transcript separation remain post-v0.1 work.
 
-1. Profiles, board registry, serial ownership, capture, and state detection.
-2. Power abstraction plus verified on/off/cycle operations.
-3. U-Boot synchronization and guarded command execution.
-4. Linux boot detection, login, guarded command execution, reboot, and shutdown.
-5. MCP resources, task/progress support, audit persistence, and real-hardware
-   qualification.
+## 20. Delivery status
 
-## 21. Open design decisions
+1. Complete: profiles, board registry, serial ownership, capture, state
+   detection, active probing, and real-time Unix-socket monitoring.
+2. Complete: verified Matter on/off/cycle operations and graceful shutdown.
+3. Complete: U-Boot synchronization, atomic reboot/reset-to-U-Boot, and
+   unrestricted one-line command execution.
+4. Complete: Linux boot detection, login, one-line command execution, reboot,
+   and shutdown.
+5. Deferred: MCP resources, task/progress support, cancellation, persistent
+   audit records, richer command transcript results, and broader qualification.
 
-- Whether the first implementation should use Rust or Python.
-- Which MCP SDK best supports the selected stable protocol and task model.
+## 21. Remaining design decisions
+
 - Whether credentials should use OS keyrings, environment-backed secret files,
   or an external secret provider.
 - Whether SSH should be added later as an alternative Linux transport.
-- Whether command policy should use declarative templates only or permit signed
-  extension modules.
 - Which state-machine and transcript data should survive server restart.
+- Whether command results should always be successful transcript envelopes,
+  including on timeout and nonzero exit, instead of MCP tool errors.
+- Whether to add an atomic power-on-to-U-Boot tool and generalized state-aware
+  reboot tool.
