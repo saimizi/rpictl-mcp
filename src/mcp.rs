@@ -150,9 +150,35 @@ pub struct LinuxLoginRequest {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RebootLinuxRequest {
     pub board_id: String,
-    pub wait_for: Option<String>,
+    #[schemars(
+        description = "Optional passive state to wait for after reboot. Use enter_uboot(restart=auto) to stop at U-Boot, or linux_login after waiting for linux_login to reach a shell."
+    )]
+    pub wait_for: Option<RebootWaitFor>,
     pub timeout_ms: Option<u64>,
     pub confirmation: bool,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RebootWaitFor {
+    #[schemars(
+        description = "Return when the fresh U-Boot autoboot countdown is observed; does not interrupt it"
+    )]
+    UbootCountdown,
+    #[schemars(description = "Return when fresh Linux kernel boot output is observed")]
+    LinuxBooting,
+    #[schemars(description = "Return when the fresh Linux login prompt is observed")]
+    LinuxLogin,
+}
+
+impl RebootWaitFor {
+    fn board_state(self) -> BoardState {
+        match self {
+            Self::UbootCountdown => BoardState::UbootCountdown,
+            Self::LinuxBooting => BoardState::LinuxBooting,
+            Self::LinuxLogin => BoardState::LinuxLogin,
+        }
+    }
 }
 
 #[tool_router(router = tool_router)]
@@ -605,7 +631,7 @@ impl RpictlServer {
     }
 
     #[tool(
-        description = "Run the configured Linux reboot path and optionally wait for a new boot state"
+        description = "Reboot Linux and optionally wait passively for uboot_countdown, linux_booting, or linux_login; use enter_uboot to stop at U-Boot"
     )]
     fn reboot_linux(
         &self,
@@ -620,9 +646,7 @@ impl RpictlServer {
             .map_err(|e| e.to_string())?;
         let states = request
             .wait_for
-            .as_ref()
-            .map(|value| parse_states(std::slice::from_ref(value)))
-            .transpose()?
+            .map(|value| vec![value.board_state()])
             .unwrap_or_else(|| {
                 vec![
                     BoardState::UbootCountdown,

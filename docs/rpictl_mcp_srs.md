@@ -319,7 +319,12 @@ are MCP errors; retained serial bytes remain available through `capture_serial`.
 #### `reboot_linux`
 
 Requires explicit confirmation, sends `reboot` from the Linux console, marks a
-new console generation, and optionally waits for a named U-Boot or Linux state.
+new console generation, and optionally waits for `uboot_countdown`,
+`linux_booting`, or `linux_login`. `uboot_prompt` is intentionally not accepted
+because this passive reboot operation does not interrupt autoboot. `linux_shell`
+is not accepted because the operation does not perform login. Callers use
+`enter_uboot(restart="auto")` to stop at U-Boot, or call `linux_login` after
+waiting for `linux_login` to reach a shell.
 
 ## 9. Command transport policy
 
