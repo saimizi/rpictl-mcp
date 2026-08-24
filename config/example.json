@@ -1,0 +1,43 @@
+{
+  "serial_ring_bytes": 262144,
+  "boards": [
+    {
+      "board_id": "lab-rpi4",
+      "display_name": "Lab Raspberry Pi 4",
+      "serial": {
+        "device": "/dev/ttyUSB0",
+        "baud_rate": 115200,
+        "data_bits": 8,
+        "parity": "none",
+        "stop_bits": 1,
+        "flow_control": "none"
+      },
+      "power": {
+        "backend": "matter",
+        "identity": "node=1;endpoint=1;mac=60-15-6F-73-B3-A0"
+      },
+      "patterns": {
+        "uboot_countdown": "Hit any key to stop autoboot",
+        "uboot_prompt": "U-Boot>",
+        "linux_boot": "Linux version",
+        "linux_login": "js-virt login:",
+        "linux_shell": "root@js-virt:",
+        "shutdown": "reboot: Power down"
+      },
+      "uboot": {
+        "interrupt": " ",
+        "boot_command": "reset"
+      },
+      "linux": {
+        "account": "root",
+        "credential_ref": "env:RPICTL_LAB_RPI4_ROOT_PASSWORD",
+        "shutdown_command": "poweroff"
+      },
+      "timing": {
+        "operation_timeout_ms": 30000,
+        "power_cycle_off_ms": 5000,
+        "serial_pacing_ms": 2
+      }
+    }
+  ]
+}
