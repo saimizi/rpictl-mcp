@@ -102,6 +102,20 @@ pub struct PowerOnRequest {
     pub wait_for: Option<String>,
 }
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PowerOnUbootRequest {
+    pub board_id: String,
+    #[schemars(description = "Maximum time to wait for the fresh U-Boot countdown")]
+    pub timeout_ms: Option<u64>,
+}
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PowerOnLinuxRequest {
+    pub board_id: String,
+    #[schemars(description = "Log in with the configured account and wait for a shell")]
+    pub login: Option<bool>,
+    #[schemars(description = "Maximum time to wait for Linux login or shell evidence")]
+    pub timeout_ms: Option<u64>,
+}
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PowerOffRequest {
     pub board_id: String,
     pub mode: String,
@@ -358,6 +372,57 @@ impl RpictlServer {
                 .map_err(|e| e.to_string())?;
         }
         Ok(Json(result))
+    }
+
+    #[tool(
+        description = "Atomically power on a board, interrupt fresh autoboot, and verify the U-Boot prompt"
+    )]
+    fn power_on_uboot(
+        &self,
+        Parameters(request): Parameters<PowerOnUbootRequest>,
+    ) -> Result<Json<OperationResult>, String> {
+        let board = self
+            .registry
+            .board(&request.board_id)
+            .map_err(|e| e.to_string())?;
+        Ok(Json(
+            self.registry
+                .power_on_uboot(
+                    &request.board_id,
+                    std::time::Duration::from_millis(
+                        request
+                            .timeout_ms
+                            .unwrap_or(board.profile.timing.operation_timeout_ms),
+                    ),
+                )
+                .map_err(|e| e.to_string())?,
+        ))
+    }
+
+    #[tool(
+        description = "Atomically power on a board and verify Linux login, optionally logging in to a shell"
+    )]
+    fn power_on_linux(
+        &self,
+        Parameters(request): Parameters<PowerOnLinuxRequest>,
+    ) -> Result<Json<OperationResult>, String> {
+        let board = self
+            .registry
+            .board(&request.board_id)
+            .map_err(|e| e.to_string())?;
+        Ok(Json(
+            self.registry
+                .power_on_linux(
+                    &request.board_id,
+                    request.login.unwrap_or(false),
+                    std::time::Duration::from_millis(
+                        request
+                            .timeout_ms
+                            .unwrap_or(board.profile.timing.operation_timeout_ms),
+                    ),
+                )
+                .map_err(|e| e.to_string())?,
+        ))
     }
 
     #[tool(

@@ -379,6 +379,99 @@ impl BoardRegistry {
             Ok(state.raw)
         })
     }
+
+    pub fn power_on_uboot(&self, board_id: &str, timeout: Duration) -> Result<OperationResult> {
+        self.operation(
+            board_id,
+            "power_on_uboot",
+            Some("uboot_prompt"),
+            |_, actions| {
+                if self.power_state(board_id)?.state == "on" {
+                    return Err(Error::new(
+                        ErrorCode::PowerStateUnverified,
+                        "power_on_uboot",
+                        "board is already powered on; use enter_uboot instead",
+                    ));
+                }
+                self.set_power(board_id, true)?;
+                let board = self.board(board_id)?;
+                board.serial.lock().unwrap().mark_generation();
+                let countdown_cursor = board.serial.lock().unwrap().next_cursor();
+                actions.push("verified relay on".into());
+                self.wait_for_states_after(
+                    board_id,
+                    &[BoardState::UbootCountdown],
+                    timeout,
+                    countdown_cursor,
+                )?;
+
+                let prompt_cursor = board.serial.lock().unwrap().next_cursor();
+                self.write_console(board_id, board.profile.uboot.interrupt.as_bytes())?;
+                actions.push("interrupted the fresh U-Boot autoboot countdown".into());
+                let state = self.wait_for_states_after(
+                    board_id,
+                    &[BoardState::UbootPrompt],
+                    Duration::from_secs(10),
+                    prompt_cursor,
+                )?;
+                Ok(format!("observed {}", state_name(state)))
+            },
+        )
+    }
+
+    pub fn power_on_linux(
+        &self,
+        board_id: &str,
+        login: bool,
+        timeout: Duration,
+    ) -> Result<OperationResult> {
+        self.operation(
+            board_id,
+            "power_on_linux",
+            Some(if login { "linux_shell" } else { "linux_login" }),
+            |_, actions| {
+                if self.power_state(board_id)?.state == "on" {
+                    return Err(Error::new(
+                        ErrorCode::PowerStateUnverified,
+                        "power_on_linux",
+                        "board is already powered on; use boot_linux or linux_login instead",
+                    ));
+                }
+                self.set_power(board_id, true)?;
+                let board = self.board(board_id)?;
+                board.serial.lock().unwrap().mark_generation();
+                let boot_cursor = board.serial.lock().unwrap().next_cursor();
+                actions.push("verified relay on".into());
+                let state = self.wait_for_states_after(
+                    board_id,
+                    &[BoardState::LinuxLogin, BoardState::LinuxShell],
+                    timeout,
+                    boot_cursor,
+                )?;
+                if !login || state == BoardState::LinuxShell {
+                    return Ok(format!("observed {}", state_name(state)));
+                }
+
+                let account = board.profile.linux.account.as_deref().ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::InvalidConfiguration,
+                        "linux_login",
+                        "Linux account is not configured",
+                    )
+                })?;
+                let shell_cursor = board.serial.lock().unwrap().next_cursor();
+                self.write_console(board_id, format!("{account}\r").as_bytes())?;
+                actions.push("sent configured Linux account".into());
+                let state = self.wait_for_states_after(
+                    board_id,
+                    &[BoardState::LinuxShell],
+                    timeout,
+                    shell_cursor,
+                )?;
+                Ok(format!("observed {}", state_name(state)))
+            },
+        )
+    }
     pub fn forced_power_off(&self, board_id: &str, confirmed: bool) -> Result<OperationResult> {
         if !confirmed {
             return Err(Error::new(

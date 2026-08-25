@@ -217,6 +217,22 @@ operation verifies relay state. v0.1 callers that need atomic power-on and
 U-Boot entry should immediately call `enter_uboot` after waiting for the fresh
 countdown.
 
+#### `power_on_uboot`
+
+Atomically verifies that the board is off, powers it on, marks a fresh console
+generation, waits for the U-Boot countdown, sends the configured interrupt, and
+verifies `uboot_prompt`. Inputs are `board_id` and optional `timeout_ms`. If the
+board is already on, callers use `enter_uboot` instead.
+
+#### `power_on_linux`
+
+Atomically verifies that the board is off, powers it on, marks a fresh console
+generation, and waits for `linux_login` or an already-present `linux_shell`.
+Inputs are `board_id`, optional `timeout_ms`, and optional `login`. With
+`login=true`, the tool submits the configured account at `linux_login` and
+verifies `linux_shell`. If the board is already on, callers use `boot_linux` or
+`linux_login` as appropriate.
+
 #### `power_off`
 
 Inputs include:
@@ -514,7 +530,8 @@ unknown-state recovery, and richer transcript separation remain post-v0.1 work.
 
 1. Complete: profiles, board registry, serial ownership, capture, state
    detection, active probing, and real-time Unix-socket monitoring.
-2. Complete: verified Matter on/off/cycle operations and graceful shutdown.
+2. Complete: verified Matter on/off/cycle operations, atomic power-on-to-U-Boot
+   and power-on-to-Linux flows, and graceful shutdown.
 3. Complete: U-Boot synchronization, atomic reboot/reset-to-U-Boot, and
    unrestricted one-line command execution.
 4. Complete: Linux boot detection, login, one-line command execution, reboot,
@@ -530,5 +547,4 @@ unknown-state recovery, and richer transcript separation remain post-v0.1 work.
 - Which state-machine and transcript data should survive server restart.
 - Whether command results should always be successful transcript envelopes,
   including on timeout and nonzero exit, instead of MCP tool errors.
-- Whether to add an atomic power-on-to-U-Boot tool and generalized state-aware
-  reboot tool.
+- Whether to add a generalized state-aware reboot tool.
