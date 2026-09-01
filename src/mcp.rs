@@ -39,6 +39,11 @@ pub struct BoardSummary {
     pub lease_owner_operation_id: Option<String>,
 }
 
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct BoardsListResult {
+    pub boards: Vec<BoardSummary>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BoardRequest {
     #[schemars(description = "Configured board identifier")]
@@ -205,9 +210,9 @@ impl RpictlServer {
     }
 
     #[tool(description = "List configured Raspberry Pi boards and their lease availability")]
-    fn list_boards(&self) -> Json<Vec<BoardSummary>> {
-        Json(
-            self.registry
+    fn list_boards(&self) -> Json<BoardsListResult> {
+        Json(BoardsListResult {
+            boards: self.registry
                 .list()
                 .into_iter()
                 .map(|board| {
@@ -222,7 +227,7 @@ impl RpictlServer {
                     }
                 })
                 .collect(),
-        )
+        })
     }
 
     #[tool(
@@ -765,5 +770,33 @@ impl ServerHandler for RpictlServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions("Safely control configured Raspberry Pi boards through verified power, bounded UART capture, U-Boot, and Linux operations.")
+    }
+}
+
+#[cfg(test)]
+mod mcp_schema_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::BoardRegistry;
+
+    #[test]
+    fn test_all_tools_have_object_output_schemas() {
+        let config_str = std::fs::read_to_string("config/example.json").unwrap();
+        let config: Config = serde_json::from_str(&config_str).unwrap();
+        let registry = BoardRegistry::new(config).unwrap();
+        let _server = RpictlServer::new(registry);
+        let router = RpictlServer::tool_router();
+        for (name, route) in &router.map {
+            if let Some(ref out_schema) = route.attr.output_schema {
+                let type_val = out_schema.get("type").and_then(|v| v.as_str());
+                assert_eq!(
+                    type_val,
+                    Some("object"),
+                    "Tool '{}' must have an output schema of type 'object', but found type {:?}",
+                    name,
+                    type_val
+                );
+            }
+        }
     }
 }
