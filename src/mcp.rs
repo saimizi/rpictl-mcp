@@ -200,17 +200,48 @@ impl RebootWaitFor {
     }
 }
 
-#[tool_router(router = tool_router)]
 impl RpictlServer {
-    pub fn new(registry: BoardRegistry) -> Self {
+    pub fn new(registry: BoardRegistry, gemini: bool) -> Self {
+        let tool_router = if gemini {
+            Self::common_router() + Self::gemini_list_boards_router()
+        } else {
+            Self::common_router() + Self::default_list_boards_router()
+        };
         Self {
             registry,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
+}
 
-    #[tool(description = "List configured Raspberry Pi boards and their lease availability")]
-    fn list_boards(&self) -> Json<BoardsListResult> {
+#[tool_router(router = default_list_boards_router)]
+impl RpictlServer {
+    #[tool(name = "list_boards", description = "List configured Raspberry Pi boards and their lease availability")]
+    fn list_boards_default(&self) -> Json<Vec<BoardSummary>> {
+        Json(
+            self.registry
+                .list()
+                .into_iter()
+                .map(|board| {
+                    let owner = board.lease.owner();
+                    BoardSummary {
+                        board_id: board.profile.board_id.clone(),
+                        display_name: board.profile.display_name.clone(),
+                        serial_device: board.profile.serial.device.clone(),
+                        power_backend: board.profile.power.backend.clone(),
+                        available: owner.is_none(),
+                        lease_owner_operation_id: owner.map(|value| value.operation_id),
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+#[tool_router(router = gemini_list_boards_router)]
+impl RpictlServer {
+    #[tool(name = "list_boards", description = "List configured Raspberry Pi boards and their lease availability")]
+    fn list_boards_gemini(&self) -> Json<BoardsListResult> {
         Json(BoardsListResult {
             boards: self.registry
                 .list()
@@ -229,7 +260,10 @@ impl RpictlServer {
                 .collect(),
         })
     }
+}
 
+#[tool_router(router = common_router)]
+impl RpictlServer {
     #[tool(
         description = "Infer board state from serial evidence, optionally sending Enter as a safe active probe"
     )]
@@ -780,23 +814,34 @@ mod mcp_schema_tests {
     use crate::BoardRegistry;
 
     #[test]
-    fn test_all_tools_have_object_output_schemas() {
+    fn test_all_tools_have_object_output_schemas_with_gemini() {
         let config_str = std::fs::read_to_string("config/example.json").unwrap();
         let config: Config = serde_json::from_str(&config_str).unwrap();
         let registry = BoardRegistry::new(config).unwrap();
-        let _server = RpictlServer::new(registry);
-        let router = RpictlServer::tool_router();
-        for (name, route) in &router.map {
+        let server = RpictlServer::new(registry, true);
+        for (name, route) in &server.tool_router.map {
             if let Some(ref out_schema) = route.attr.output_schema {
                 let type_val = out_schema.get("type").and_then(|v| v.as_str());
                 assert_eq!(
                     type_val,
                     Some("object"),
-                    "Tool '{}' must have an output schema of type 'object', but found type {:?}",
+                    "Tool '{}' must have an output schema of type 'object' when gemini=true, but found type {:?}",
                     name,
                     type_val
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_list_boards_schema_default_mode() {
+        let config_str = std::fs::read_to_string("config/example.json").unwrap();
+        let config: Config = serde_json::from_str(&config_str).unwrap();
+        let registry = BoardRegistry::new(config).unwrap();
+        let server = RpictlServer::new(registry, false);
+        let route = server.tool_router.map.get("list_boards").unwrap();
+        let out_schema = route.attr.output_schema.as_ref().unwrap();
+        let type_val = out_schema.get("type").and_then(|v| v.as_str());
+        assert_eq!(type_val, Some("array"));
     }
 }

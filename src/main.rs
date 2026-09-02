@@ -4,12 +4,16 @@ use rmcp::ServiceExt;
 use rpictl_mcp::{BoardRegistry, Config, console, mcp::RpictlServer};
 
 fn usage() {
-    eprintln!("usage:");
+    eprintln!("Usage:");
     eprintln!("  rpictl-mcp doctor <config.json>");
-    eprintln!("  rpictl-mcp serve <config.json> [socket-path]");
+    eprintln!("  rpictl-mcp serve <config.json> [--gemini] [socket-path]");
     eprintln!("  rpictl-mcp console <board_id> [socket-path]");
     eprintln!("  rpictl-mcp monitor <board_id> [socket-path]");
     eprintln!("  rpictl-mcp power <on|off|force-off|cycle|status> <board_id> [socket-path]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --gemini    Enable Gemini-compatible tool schemas (wraps array outputs in object)");
+    eprintln!("  --help, -h  Show this help message");
 }
 
 fn load_registry(path: &Path) -> Result<BoardRegistry, String> {
@@ -63,6 +67,11 @@ async fn main() {
         std::process::exit(2);
     }
 
+    if args.iter().any(|arg| arg == "--help" || arg == "-h" || arg == "help") {
+        usage();
+        std::process::exit(0);
+    }
+
     let command = args.remove(0);
 
     let result = match command.as_str() {
@@ -74,6 +83,9 @@ async fn main() {
             doctor(Path::new(&args[0]))
         }
         "serve" => {
+            let gemini = args.iter().any(|arg| arg == "--gemini");
+            args.retain(|arg| arg != "--gemini");
+
             if args.is_empty() || args.len() > 2 {
                 usage();
                 std::process::exit(2);
@@ -94,7 +106,7 @@ async fn main() {
                             std::process::exit(1);
                         }
                     };
-                    match RpictlServer::new(registry)
+                    match RpictlServer::new(registry, gemini)
                         .serve(rmcp::transport::stdio())
                         .await
                     {
