@@ -10,3 +10,4 @@ rmcp = { version = "3.1.4", features = ["transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
 serialport = { version = "4.8", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+libc = "0.2"

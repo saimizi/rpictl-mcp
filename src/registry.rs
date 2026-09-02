@@ -17,6 +17,7 @@ pub struct Board {
     pub lease: BoardLease,
     pub serial: Mutex<SerialRing>,
     pub serial_writer: Mutex<Option<Box<dyn serialport::SerialPort>>>,
+    console_active: Mutex<bool>,
     serial_subscribers: Mutex<Vec<SyncSender<Vec<u8>>>>,
 }
 #[derive(Clone)]
@@ -40,6 +41,7 @@ impl BoardRegistry {
                         lease: BoardLease::default(),
                         serial: Mutex::new(SerialRing::new(capacity)),
                         serial_writer: Mutex::new(None),
+                        console_active: Mutex::new(false),
                         serial_subscribers: Mutex::new(Vec::new()),
                     }),
                 )
@@ -123,5 +125,35 @@ impl BoardRegistry {
             })?
             .push(sender);
         Ok(receiver)
+    }
+
+    pub fn claim_console(&self, board_id: &str) -> Result<ConsoleClaim> {
+        let board = self.board(board_id)?;
+        {
+            let mut active = board.console_active.lock().map_err(|_| {
+                Error::new(ErrorCode::BoardBusy, "console", "console lock poisoned")
+            })?;
+            if *active {
+                return Err(Error::new(
+                    ErrorCode::BoardBusy,
+                    "console",
+                    format!("board {board_id:?} already has an interactive console"),
+                ));
+            }
+            *active = true;
+        }
+        Ok(ConsoleClaim { board })
+    }
+}
+
+pub struct ConsoleClaim {
+    board: Arc<Board>,
+}
+
+impl Drop for ConsoleClaim {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.board.console_active.lock() {
+            *active = false;
+        }
     }
 }

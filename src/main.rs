@@ -1,13 +1,15 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rmcp::ServiceExt;
-use rpictl_mcp::{BoardRegistry, Config, mcp::RpictlServer, monitor};
+use rpictl_mcp::{BoardRegistry, Config, console, mcp::RpictlServer};
 
 fn usage() {
     eprintln!("usage:");
     eprintln!("  rpictl-mcp doctor <config.json>");
-    eprintln!("  rpictl-mcp serve <config.json> [monitor-socket]");
-    eprintln!("  rpictl-mcp monitor <board_id> [monitor-socket]");
+    eprintln!("  rpictl-mcp serve <config.json> [socket-path]");
+    eprintln!("  rpictl-mcp console <board_id> [socket-path]");
+    eprintln!("  rpictl-mcp monitor <board_id> [socket-path]");
+    eprintln!("  rpictl-mcp power <on|off|force-off|cycle|status> <board_id> [socket-path]");
 }
 
 fn load_registry(path: &Path) -> Result<BoardRegistry, String> {
@@ -55,62 +57,101 @@ fn doctor(path: &Path) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
-    let mut args = std::env::args_os().skip(1);
-    let Some(command) = args.next() else {
-        usage();
-        std::process::exit(2);
-    };
-    let Some(argument) = args.next().map(PathBuf::from) else {
-        usage();
-        std::process::exit(2);
-    };
-    let optional = args.next().map(PathBuf::from);
-    if args.next().is_some() {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
         usage();
         std::process::exit(2);
     }
 
-    let result = match command.to_str() {
-        Some("doctor") if optional.is_none() => doctor(&argument),
-        Some("serve") => match load_registry(&argument) {
-            Ok(registry) => {
-                registry.start_serial_readers();
-                let socket_path = optional
-                    .as_deref()
-                    .unwrap_or_else(|| Path::new(monitor::DEFAULT_SOCKET));
-                let _monitor = match monitor::start(registry.clone(), socket_path) {
-                    Ok(monitor) => monitor,
-                    Err(error) => {
-                        eprintln!("rpictl-mcp: {error}");
-                        std::process::exit(1);
-                    }
-                };
-                match RpictlServer::new(registry)
-                    .serve(rmcp::transport::stdio())
-                    .await
-                {
-                    Ok(service) => service
-                        .waiting()
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| format!("MCP server failed: {error}")),
-                    Err(error) => Err(format!("MCP startup failed: {error}")),
-                }
+    let command = args.remove(0);
+
+    let result = match command.as_str() {
+        "doctor" => {
+            if args.len() != 1 {
+                usage();
+                std::process::exit(2);
             }
-            Err(error) => Err(error),
-        },
-        Some("monitor") => {
-            let board_id = argument.to_string_lossy();
-            let socket_path = optional
-                .as_deref()
-                .unwrap_or_else(|| Path::new(monitor::DEFAULT_SOCKET));
-            monitor::run_client(&board_id, socket_path)
+            doctor(Path::new(&args[0]))
+        }
+        "serve" => {
+            if args.is_empty() || args.len() > 2 {
+                usage();
+                std::process::exit(2);
+            }
+            let config_path = Path::new(&args[0]);
+            let socket_path = args
+                .get(1)
+                .map(Path::new)
+                .unwrap_or_else(|| Path::new(console::DEFAULT_SOCKET));
+
+            match load_registry(config_path) {
+                Ok(registry) => {
+                    registry.start_serial_readers();
+                    let _console_socket = match console::start(registry.clone(), socket_path) {
+                        Ok(sock) => sock,
+                        Err(error) => {
+                            eprintln!("rpictl-mcp: {error}");
+                            std::process::exit(1);
+                        }
+                    };
+                    match RpictlServer::new(registry)
+                        .serve(rmcp::transport::stdio())
+                        .await
+                    {
+                        Ok(service) => service
+                            .waiting()
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| format!("MCP server failed: {error}")),
+                        Err(error) => Err(format!("MCP startup failed: {error}")),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
+        "console" => {
+            if args.is_empty() || args.len() > 2 {
+                usage();
+                std::process::exit(2);
+            }
+            let board_id = &args[0];
+            let socket_path = args
+                .get(1)
+                .map(Path::new)
+                .unwrap_or_else(|| Path::new(console::DEFAULT_SOCKET));
+            console::run_console(board_id, socket_path)
+        }
+        "monitor" => {
+            if args.is_empty() || args.len() > 2 {
+                usage();
+                std::process::exit(2);
+            }
+            let board_id = &args[0];
+            let socket_path = args
+                .get(1)
+                .map(Path::new)
+                .unwrap_or_else(|| Path::new(console::DEFAULT_SOCKET));
+            console::run_monitor(board_id, socket_path)
+        }
+        "power" => {
+            if args.len() < 2 || args.len() > 3 {
+                usage();
+                std::process::exit(2);
+            }
+            let action = &args[0];
+            let board_id = &args[1];
+            let socket_path = args
+                .get(2)
+                .map(Path::new)
+                .unwrap_or_else(|| Path::new(console::DEFAULT_SOCKET));
+            console::run_power(action, board_id, socket_path)
         }
         _ => {
             usage();
-            Err(format!("unknown command: {}", command.to_string_lossy()))
+            Err(format!("unknown command: {command}"))
         }
     };
+
     if let Err(error) = result {
         eprintln!("rpictl-mcp: {error}");
         std::process::exit(1);

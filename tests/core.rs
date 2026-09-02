@@ -147,3 +147,56 @@ fn state_detector_uses_most_recent_matching_pattern() {
     assert_eq!(evidence.state, BoardState::LinuxLogin);
     assert_eq!(evidence.evidence, b"login:");
 }
+
+#[test]
+fn console_socket_handles_power_commands_and_in_console_escapes() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let registry = BoardRegistry::new(Config {
+        boards: vec![board("board-a", "/dev/fake-serial-a", "node=1;endpoint=1")],
+        serial_ring_bytes: 1024,
+    })
+    .unwrap();
+
+    let sock_path = format!("/tmp/rpictl-test-{}.sock", uuid::Uuid::new_v4());
+    let sock = rpictl_mcp::console::start(registry, std::path::Path::new(&sock_path)).unwrap();
+
+    // Test POWER subcommand over socket
+    {
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
+        stream.write_all(b"POWER status board-a\n").unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        assert!(
+            response.starts_with("err power status failed:")
+                || response.starts_with("ok  power state:")
+        );
+    }
+
+    // Test CONSOLE mode and in-console command
+    {
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
+        // Send the handshake and first command together to exercise BufReader
+        // prefetching and protocol framing.
+        stream.write_all(b"CONSOLE board-a\n\0help\n").unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        // Read until we see @help output
+        for _ in 0..5 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() && !line.is_empty() {
+                response.push_str(&line);
+                if response.contains("poweron") {
+                    break;
+                }
+            }
+        }
+        assert!(response.contains("poweron"));
+        assert!(!response.contains("@poweron"));
+    }
+
+    drop(sock);
+}
