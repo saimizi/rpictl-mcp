@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::BoardRegistry;
+use crate::client::{RpcRequest, RpcResponse};
 use crate::lease::LeaseOwner;
 
 pub const DEFAULT_SOCKET: &str = "/tmp/rpictl-mcp.sock";
@@ -66,6 +67,176 @@ pub fn start(registry: BoardRegistry, path: &Path) -> Result<ConsoleSocket, Stri
     Ok(ConsoleSocket { path: path_owned })
 }
 
+fn handle_rpc(registry: &BoardRegistry, json_str: &str) -> RpcResponse {
+    let req: RpcRequest = match serde_json::from_str(json_str) {
+        Ok(req) => req,
+        Err(err) => {
+            return RpcResponse {
+                ok: false,
+                result: None,
+                error: Some(format!("invalid RPC request JSON: {err}")),
+            };
+        }
+    };
+
+    let result = match req {
+        RpcRequest::ListBoards => {
+            serde_json::to_value(registry.list_board_summaries()).map_err(|e| e.to_string())
+        }
+        RpcRequest::GetBoardState(r) => registry
+            .board_state(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::GetPowerState(r) => registry
+            .board_power_state(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::CaptureSerial(r) => registry
+            .capture_board_serial(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::PowerOn(r) => registry
+            .power_on_board(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::PowerOnUboot(r) => registry
+            .power_on_uboot_board(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::PowerOnLinux(r) => registry
+            .power_on_linux_board(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::PowerOff(r) => registry
+            .power_off_board(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::PowerCycle(r) => registry
+            .power_cycle_board(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::WaitForState(r) => registry
+            .wait_for_board_state(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::EnterUboot(r) => registry
+            .enter_board_uboot(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::RunUbootCommand(r) => registry
+            .run_board_uboot_command(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::BootLinux(r) => registry
+            .boot_board_linux(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::LinuxLogin(r) => registry
+            .linux_board_login(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::RunLinuxCommand(r) => registry
+            .run_board_linux_command(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+        RpcRequest::RebootLinux(r) => registry
+            .reboot_board_linux(&r)
+            .and_then(|v| {
+                serde_json::to_value(v).map_err(|e| {
+                    crate::Error::new(crate::ErrorCode::InvalidConfiguration, "rpc", e.to_string())
+                })
+            })
+            .map_err(|e| e.to_string()),
+    };
+
+    match result {
+        Ok(value) => RpcResponse {
+            ok: true,
+            result: Some(value),
+            error: None,
+        },
+        Err(err) => RpcResponse {
+            ok: false,
+            result: None,
+            error: Some(err),
+        },
+    }
+}
+
+pub fn stop_daemon(path: &Path) -> Result<(), String> {
+    if !crate::client::ping_daemon(path) {
+        return Err(format!("daemon is not running on {}", path.display()));
+    }
+    let mut stream = UnixStream::connect(path)
+        .map_err(|e| format!("cannot connect to daemon on {}: {e}", path.display()))?;
+    let _ = stream.write_all(b"SHUTDOWN\n");
+    let _ = stream.flush();
+
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(100));
+        if !crate::client::ping_daemon(path) {
+            return Ok(());
+        }
+    }
+    Err("daemon did not stop in time".into())
+}
+
 fn serve_client(registry: &BoardRegistry, mut stream: UnixStream) {
     let Ok(reader_stream) = stream.try_clone() else {
         return;
@@ -76,6 +247,33 @@ fn serve_client(registry: &BoardRegistry, mut stream: UnixStream) {
         return;
     }
     let handshake_trimmed = handshake.trim();
+
+    if handshake_trimmed == "PING" {
+        let _ = stream.write_all(b"PONG\n");
+        let _ = stream.flush();
+        return;
+    }
+
+    if handshake_trimmed == "SHUTDOWN" {
+        let _ = stream.write_all(b"ok shutting down\n");
+        let _ = stream.flush();
+        thread::spawn(|| {
+            thread::sleep(Duration::from_millis(50));
+            std::process::exit(0);
+        });
+        return;
+    }
+
+    if let Some(rpc_json) = handshake_trimmed.strip_prefix("RPC ") {
+        let response = handle_rpc(registry, rpc_json);
+        let mut resp_str = serde_json::to_string(&response).unwrap_or_else(|err| {
+            format!(r#"{{"ok":false,"error":{:?}}}"#, err.to_string())
+        });
+        resp_str.push('\n');
+        let _ = stream.write_all(resp_str.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
 
     // Handle POWER subcommands: POWER <action> <board_id>
     if let Some(rest) = handshake_trimmed.strip_prefix("POWER ") {

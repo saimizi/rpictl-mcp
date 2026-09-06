@@ -1,5 +1,4 @@
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::{
     Json, ServerHandler,
@@ -7,17 +6,24 @@ use rmcp::{
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     BoardRegistry,
+    client::SocketClient,
     operations::OperationResult,
-    state::{BoardState, StateDetector},
+    state::BoardState,
 };
 
 #[derive(Clone)]
+pub enum ServerBackend {
+    Local(BoardRegistry),
+    Remote(SocketClient),
+}
+
+#[derive(Clone)]
 pub struct RpictlServer {
-    registry: BoardRegistry,
+    backend: ServerBackend,
     tool_router: ToolRouter<Self>,
 }
 
@@ -29,7 +35,7 @@ impl fmt::Debug for RpictlServer {
     }
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BoardSummary {
     pub board_id: String,
     pub display_name: Option<String>,
@@ -39,18 +45,18 @@ pub struct BoardSummary {
     pub lease_owner_operation_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BoardsListResult {
     pub boards: Vec<BoardSummary>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BoardRequest {
     #[schemars(description = "Configured board identifier")]
     pub board_id: String,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BoardStateRequest {
     #[schemars(description = "Configured board identifier")]
     pub board_id: String,
@@ -60,7 +66,7 @@ pub struct BoardStateRequest {
     pub active_probe: Option<bool>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BoardStateResult {
     pub board_id: String,
     pub state: String,
@@ -71,7 +77,7 @@ pub struct BoardStateResult {
     pub active_probe: bool,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PowerStateResult {
     pub board_id: String,
     pub state: String,
@@ -81,7 +87,7 @@ pub struct PowerStateResult {
     pub detail: String,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CaptureSerialRequest {
     pub board_id: String,
     #[schemars(description = "Maximum bytes to return; defaults to 65536")]
@@ -90,7 +96,7 @@ pub struct CaptureSerialRequest {
     pub cursor: Option<u64>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SerialCaptureResult {
     pub board_id: String,
     pub text: String,
@@ -101,18 +107,20 @@ pub struct SerialCaptureResult {
     pub invalid_utf8: bool,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PowerOnRequest {
     pub board_id: String,
     pub wait_for: Option<String>,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PowerOnUbootRequest {
     pub board_id: String,
     #[schemars(description = "Maximum time to wait for the fresh U-Boot countdown")]
     pub timeout_ms: Option<u64>,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PowerOnLinuxRequest {
     pub board_id: String,
     #[schemars(description = "Log in with the configured account and wait for a shell")]
@@ -120,14 +128,16 @@ pub struct PowerOnLinuxRequest {
     #[schemars(description = "Maximum time to wait for Linux login or shell evidence")]
     pub timeout_ms: Option<u64>,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PowerOffRequest {
     pub board_id: String,
     pub mode: String,
     pub reason: String,
     pub confirmation: bool,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PowerCycleRequest {
     pub board_id: String,
     pub mode: String,
@@ -135,18 +145,21 @@ pub struct PowerCycleRequest {
     pub wait_for: Option<String>,
     pub confirmation: bool,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WaitStateRequest {
     pub board_id: String,
     pub states: Vec<String>,
     pub timeout_ms: u64,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EnterUbootRequest {
     pub board_id: String,
     pub restart: String,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CommandRequest {
     pub board_id: String,
     pub command: String,
@@ -154,19 +167,22 @@ pub struct CommandRequest {
     pub expected_patterns: Option<Vec<String>>,
     pub allow_reboot: Option<bool>,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BootLinuxRequest {
     pub board_id: String,
     pub login: Option<bool>,
     pub timeout_ms: Option<u64>,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LinuxLoginRequest {
     pub board_id: String,
     pub account: Option<String>,
     pub timeout_ms: Option<u64>,
 }
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RebootLinuxRequest {
     pub board_id: String,
     #[schemars(
@@ -177,7 +193,7 @@ pub struct RebootLinuxRequest {
     pub confirmation: bool,
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RebootWaitFor {
     #[schemars(
@@ -191,7 +207,7 @@ pub enum RebootWaitFor {
 }
 
 impl RebootWaitFor {
-    fn board_state(self) -> BoardState {
+    pub fn board_state(self) -> BoardState {
         match self {
             Self::UbootCountdown => BoardState::UbootCountdown,
             Self::LinuxBooting => BoardState::LinuxBooting,
@@ -202,13 +218,25 @@ impl RebootWaitFor {
 
 impl RpictlServer {
     pub fn new(registry: BoardRegistry, gemini: bool) -> Self {
+        Self::new_local(registry, gemini)
+    }
+
+    pub fn new_local(registry: BoardRegistry, gemini: bool) -> Self {
+        Self::new_with_backend(ServerBackend::Local(registry), gemini)
+    }
+
+    pub fn new_remote(client: SocketClient, gemini: bool) -> Self {
+        Self::new_with_backend(ServerBackend::Remote(client), gemini)
+    }
+
+    fn new_with_backend(backend: ServerBackend, gemini: bool) -> Self {
         let tool_router = if gemini {
             Self::common_router() + Self::gemini_list_boards_router()
         } else {
             Self::common_router() + Self::default_list_boards_router()
         };
         Self {
-            registry,
+            backend,
             tool_router,
         }
     }
@@ -217,48 +245,25 @@ impl RpictlServer {
 #[tool_router(router = default_list_boards_router)]
 impl RpictlServer {
     #[tool(name = "list_boards", description = "List configured Raspberry Pi boards and their lease availability")]
-    fn list_boards_default(&self) -> Json<Vec<BoardSummary>> {
-        Json(
-            self.registry
-                .list()
-                .into_iter()
-                .map(|board| {
-                    let owner = board.lease.owner();
-                    BoardSummary {
-                        board_id: board.profile.board_id.clone(),
-                        display_name: board.profile.display_name.clone(),
-                        serial_device: board.profile.serial.device.clone(),
-                        power_backend: board.profile.power.backend.clone(),
-                        available: owner.is_none(),
-                        lease_owner_operation_id: owner.map(|value| value.operation_id),
-                    }
-                })
-                .collect(),
-        )
+    fn list_boards_default(&self) -> Result<Json<Vec<BoardSummary>>, String> {
+        match &self.backend {
+            ServerBackend::Local(registry) => Ok(Json(registry.list_board_summaries())),
+            ServerBackend::Remote(client) => {
+                client.list_boards().map(Json).map_err(|e| e.to_string())
+            }
+        }
     }
 }
 
 #[tool_router(router = gemini_list_boards_router)]
 impl RpictlServer {
     #[tool(name = "list_boards", description = "List configured Raspberry Pi boards and their lease availability")]
-    fn list_boards_gemini(&self) -> Json<BoardsListResult> {
-        Json(BoardsListResult {
-            boards: self.registry
-                .list()
-                .into_iter()
-                .map(|board| {
-                    let owner = board.lease.owner();
-                    BoardSummary {
-                        board_id: board.profile.board_id.clone(),
-                        display_name: board.profile.display_name.clone(),
-                        serial_device: board.profile.serial.device.clone(),
-                        power_backend: board.profile.power.backend.clone(),
-                        available: owner.is_none(),
-                        lease_owner_operation_id: owner.map(|value| value.operation_id),
-                    }
-                })
-                .collect(),
-        })
+    fn list_boards_gemini(&self) -> Result<Json<BoardsListResult>, String> {
+        let boards = match &self.backend {
+            ServerBackend::Local(registry) => registry.list_board_summaries(),
+            ServerBackend::Remote(client) => client.list_boards().map_err(|e| e.to_string())?,
+        };
+        Ok(Json(BoardsListResult { boards }))
     }
 }
 
@@ -271,61 +276,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<BoardStateRequest>,
     ) -> Result<Json<BoardStateResult>, String> {
-        let board = self
-            .registry
-            .board(&request.board_id)
-            .map_err(|error| error.to_string())?;
-        let active_probe = request.active_probe.unwrap_or(false);
-        let observe_duration =
-            std::time::Duration::from_millis(request.observe_duration_ms.unwrap_or(500).min(5_000));
-        let cursor = board
-            .serial
-            .lock()
-            .map_err(|_| "serial buffer lock is poisoned".to_string())?
-            .next_cursor();
-        if active_probe {
-            self.registry
-                .write_console(&request.board_id, b"\r")
-                .map_err(|error| error.to_string())?;
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .board_state(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .get_board_state(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
         }
-        std::thread::sleep(observe_duration);
-        let serial = board
-            .serial
-            .lock()
-            .map_err(|_| "serial buffer lock is poisoned".to_string())?;
-        let snapshot = if active_probe {
-            serial.snapshot_from(cursor, 65_536)
-        } else {
-            serial.snapshot_generation(serial.generation(), 65_536)
-        };
-        let bytes: Vec<u8> = snapshot
-            .chunks
-            .iter()
-            .flat_map(|chunk| chunk.bytes.iter().copied())
-            .collect();
-        let mut evidence = StateDetector::new(&board.profile.patterns).observe(
-            &bytes,
-            SystemTime::now(),
-            serial.generation(),
-        );
-        evidence.active_probe = active_probe;
-        Ok(Json(BoardStateResult {
-            board_id: request.board_id,
-            state: serde_json::to_value(evidence.state)
-                .unwrap_or_default()
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string(),
-            confidence: evidence.confidence,
-            timestamp_ms: evidence
-                .timestamp
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            console_generation: evidence.generation,
-            evidence: String::from_utf8_lossy(&evidence.evidence).into_owned(),
-            active_probe: evidence.active_probe,
-        }))
     }
 
     #[tool(description = "Return the configured power backend and current verification status")]
@@ -333,22 +293,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<BoardRequest>,
     ) -> Result<Json<PowerStateResult>, String> {
-        let board = self
-            .registry
-            .board(&request.board_id)
-            .map_err(|error| error.to_string())?;
-        let observation = self
-            .registry
-            .power_state(&request.board_id)
-            .map_err(|error| error.to_string())?;
-        Ok(Json(PowerStateResult {
-            board_id: request.board_id,
-            state: observation.state,
-            backend: board.profile.power.backend.clone(),
-            configured_identity: board.profile.power.identity.clone(),
-            identity_verified: observation.identity_verified,
-            detail: observation.raw,
-        }))
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .board_power_state(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .get_power_state(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+        }
     }
 
     #[tool(description = "Return bounded recent serial bytes without writing to the console")]
@@ -356,34 +310,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<CaptureSerialRequest>,
     ) -> Result<Json<SerialCaptureResult>, String> {
-        let board = self
-            .registry
-            .board(&request.board_id)
-            .map_err(|error| error.to_string())?;
-        let serial = board
-            .serial
-            .lock()
-            .map_err(|_| "serial buffer lock is poisoned".to_string())?;
-        let max_bytes = request.max_bytes.unwrap_or(65_536).clamp(1, 1_048_576);
-        let start_cursor = request
-            .cursor
-            .unwrap_or_else(|| serial.next_cursor().saturating_sub(max_bytes as u64));
-        let snapshot = serial.snapshot_from(start_cursor, max_bytes);
-        let bytes: Vec<u8> = snapshot
-            .chunks
-            .iter()
-            .flat_map(|chunk| chunk.bytes.iter().copied())
-            .collect();
-        let invalid_utf8 = std::str::from_utf8(&bytes).is_err();
-        Ok(Json(SerialCaptureResult {
-            board_id: request.board_id,
-            text: String::from_utf8_lossy(&bytes).into_owned(),
-            start_cursor,
-            next_cursor: snapshot.next_cursor,
-            console_generation: serial.generation(),
-            truncated: snapshot.truncated,
-            invalid_utf8,
-        }))
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .capture_board_serial(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .capture_serial(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+        }
     }
 
     #[tool(description = "Turn on verified board power and optionally wait for a boot state")]
@@ -391,26 +327,15 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<PowerOnRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        let result = self
-            .registry
-            .power_on(&request.board_id)
-            .map_err(|e| e.to_string())?;
-        if let Some(wait) = request.wait_for.as_deref().filter(|v| *v != "none") {
-            let states = parse_states(&[wait.to_string()])?;
-            self.registry
-                .wait_for_states(
-                    &request.board_id,
-                    &states,
-                    self.registry
-                        .board(&request.board_id)
-                        .unwrap()
-                        .profile
-                        .operation_timeout(),
-                    None,
-                )
-                .map_err(|e| e.to_string())?;
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .power_on_board(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => {
+                client.power_on(request).map(Json).map_err(|e| e.to_string())
+            }
         }
-        Ok(Json(result))
     }
 
     #[tool(
@@ -420,22 +345,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<PowerOnUbootRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        let board = self
-            .registry
-            .board(&request.board_id)
-            .map_err(|e| e.to_string())?;
-        Ok(Json(
-            self.registry
-                .power_on_uboot(
-                    &request.board_id,
-                    std::time::Duration::from_millis(
-                        request
-                            .timeout_ms
-                            .unwrap_or(board.profile.timing.operation_timeout_ms),
-                    ),
-                )
-                .map_err(|e| e.to_string())?,
-        ))
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .power_on_uboot_board(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .power_on_uboot(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+        }
     }
 
     #[tool(
@@ -445,23 +364,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<PowerOnLinuxRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        let board = self
-            .registry
-            .board(&request.board_id)
-            .map_err(|e| e.to_string())?;
-        Ok(Json(
-            self.registry
-                .power_on_linux(
-                    &request.board_id,
-                    request.login.unwrap_or(false),
-                    std::time::Duration::from_millis(
-                        request
-                            .timeout_ms
-                            .unwrap_or(board.profile.timing.operation_timeout_ms),
-                    ),
-                )
-                .map_err(|e| e.to_string())?,
-        ))
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .power_on_linux_board(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .power_on_linux(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+        }
     }
 
     #[tool(
@@ -471,20 +383,15 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<PowerOffRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        if request.reason.trim().is_empty() {
-            return Err("reason is required".into());
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .power_off_board(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => {
+                client.power_off(request).map(Json).map_err(|e| e.to_string())
+            }
         }
-        let result = match request.mode.as_str() {
-            "graceful" => self
-                .registry
-                .graceful_power_off(&request.board_id, request.confirmation),
-            "force" => self
-                .registry
-                .forced_power_off(&request.board_id, request.confirmation),
-            _ => return Err("mode must be graceful or force".into()),
-        }
-        .map_err(|e| e.to_string())?;
-        Ok(Json(result))
     }
 
     #[tool(
@@ -494,17 +401,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<PowerCycleRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        if request.reason.trim().is_empty() {
-            return Err("reason is required".into());
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .power_cycle_board(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .power_cycle(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
         }
-        if !matches!(request.mode.as_str(), "graceful" | "force") {
-            return Err("mode must be graceful or force".into());
-        }
-        Ok(Json(
-            self.registry
-                .power_cycle(&request.board_id, request.confirmation)
-                .map_err(|e| e.to_string())?,
-        ))
     }
 
     #[tool(description = "Wait for one or more board states using fresh bounded serial evidence")]
@@ -512,28 +418,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<WaitStateRequest>,
     ) -> Result<Json<BoardStateResult>, String> {
-        let states = parse_states(&request.states)?;
-        let state = self
-            .registry
-            .wait_for_states(
-                &request.board_id,
-                &states,
-                std::time::Duration::from_millis(request.timeout_ms),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(Json(BoardStateResult {
-            board_id: request.board_id,
-            state: state_string(state),
-            confidence: 0.95,
-            timestamp_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            console_generation: 0,
-            evidence: "matched current console generation".into(),
-            active_probe: false,
-        }))
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .wait_for_board_state(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .wait_for_state(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+        }
     }
 
     #[tool(
@@ -543,79 +437,15 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<EnterUbootRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        let state = self
-            .registry
-            .observed_state(&request.board_id)
-            .map_err(|e| e.to_string())?;
-        if !matches!(request.restart.as_str(), "auto" | "always" | "never") {
-            return Err("restart must be auto, always, or never".into());
-        }
-        if state == BoardState::UbootPrompt {
-            if request.restart == "always" {
-                let timeout = self
-                    .registry
-                    .board(&request.board_id)
-                    .map_err(|e| e.to_string())?
-                    .profile
-                    .operation_timeout();
-                return Ok(Json(
-                    self.registry
-                        .reset_into_uboot(&request.board_id, timeout)
-                        .map_err(|e| e.to_string())?,
-                ));
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .enter_board_uboot(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => {
+                client.enter_uboot(request).map(Json).map_err(|e| e.to_string())
             }
-            return Ok(Json(
-                self.registry
-                    .simple_console_operation(
-                        &request.board_id,
-                        "enter_uboot",
-                        b"\r",
-                        &[BoardState::UbootPrompt],
-                        std::time::Duration::from_secs(2),
-                        false,
-                    )
-                    .map_err(|e| e.to_string())?,
-            ));
         }
-        if state == BoardState::UbootCountdown {
-            let interrupt = self
-                .registry
-                .board(&request.board_id)
-                .unwrap()
-                .profile
-                .uboot
-                .interrupt
-                .clone();
-            return Ok(Json(
-                self.registry
-                    .simple_console_operation(
-                        &request.board_id,
-                        "enter_uboot",
-                        interrupt.as_bytes(),
-                        &[BoardState::UbootPrompt],
-                        std::time::Duration::from_secs(10),
-                        false,
-                    )
-                    .map_err(|e| e.to_string())?,
-            ));
-        }
-        if request.restart == "never" {
-            return Err("U-Boot is not active and restart=never".into());
-        }
-        if state == BoardState::LinuxShell {
-            let timeout = self
-                .registry
-                .board(&request.board_id)
-                .map_err(|e| e.to_string())?
-                .profile
-                .operation_timeout();
-            return Ok(Json(
-                self.registry
-                    .reboot_into_uboot(&request.board_id, timeout)
-                    .map_err(|e| e.to_string())?,
-            ));
-        }
-        Err("automatic restart requires a known Linux shell or U-Boot prompt".into())
     }
 
     #[tool(description = "Execute any one-line U-Boot command and return its serial output")]
@@ -623,17 +453,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<CommandRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        Ok(Json(
-            self.registry
-                .console_command(
-                    &request.board_id,
-                    "run_uboot_command",
-                    &request.command,
-                    false,
-                    std::time::Duration::from_millis(request.timeout_ms),
-                )
-                .map_err(|e| e.to_string())?,
-        ))
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .run_board_uboot_command(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .run_uboot_command(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+        }
     }
 
     #[tool(description = "Start the profile-defined U-Boot boot path and wait for Linux")]
@@ -641,36 +470,15 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<BootLinuxRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        let board = self
-            .registry
-            .board(&request.board_id)
-            .map_err(|e| e.to_string())?;
-        let command = format!("{}\r", board.profile.uboot.boot_command);
-        let states = if request.login.unwrap_or(false) {
-            vec![BoardState::LinuxLogin, BoardState::LinuxShell]
-        } else {
-            vec![
-                BoardState::LinuxBooting,
-                BoardState::LinuxLogin,
-                BoardState::LinuxShell,
-            ]
-        };
-        Ok(Json(
-            self.registry
-                .simple_console_operation(
-                    &request.board_id,
-                    "boot_linux",
-                    command.as_bytes(),
-                    &states,
-                    std::time::Duration::from_millis(
-                        request
-                            .timeout_ms
-                            .unwrap_or(board.profile.timing.operation_timeout_ms),
-                    ),
-                    false,
-                )
-                .map_err(|e| e.to_string())?,
-        ))
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .boot_board_linux(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => {
+                client.boot_linux(request).map(Json).map_err(|e| e.to_string())
+            }
+        }
     }
 
     #[tool(
@@ -680,40 +488,15 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<LinuxLoginRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        let board = self
-            .registry
-            .board(&request.board_id)
-            .map_err(|e| e.to_string())?;
-        let configured = board
-            .profile
-            .linux
-            .account
-            .as_deref()
-            .ok_or("Linux account is not configured")?;
-        if request
-            .account
-            .as_deref()
-            .is_some_and(|value| value != configured)
-        {
-            return Err("requested account is not configured".into());
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .linux_board_login(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => {
+                client.linux_login(request).map(Json).map_err(|e| e.to_string())
+            }
         }
-        let line = format!("{configured}\r");
-        Ok(Json(
-            self.registry
-                .simple_console_operation(
-                    &request.board_id,
-                    "linux_login",
-                    line.as_bytes(),
-                    &[BoardState::LinuxShell],
-                    std::time::Duration::from_millis(
-                        request
-                            .timeout_ms
-                            .unwrap_or(board.profile.timing.operation_timeout_ms),
-                    ),
-                    false,
-                )
-                .map_err(|e| e.to_string())?,
-        ))
     }
 
     #[tool(description = "Execute one policy-authorized Linux command and capture bounded output")]
@@ -721,17 +504,16 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<CommandRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        Ok(Json(
-            self.registry
-                .console_command(
-                    &request.board_id,
-                    "run_linux_command",
-                    &request.command,
-                    true,
-                    std::time::Duration::from_millis(request.timeout_ms),
-                )
-                .map_err(|e| e.to_string())?,
-        ))
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .run_board_linux_command(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .run_linux_command(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+        }
     }
 
     #[tool(
@@ -741,62 +523,17 @@ impl RpictlServer {
         &self,
         Parameters(request): Parameters<RebootLinuxRequest>,
     ) -> Result<Json<OperationResult>, String> {
-        if !request.confirmation {
-            return Err("CONFIRMATION_REQUIRED: reboot requires confirmation=true".into());
+        match &self.backend {
+            ServerBackend::Local(registry) => registry
+                .reboot_board_linux(&request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
+            ServerBackend::Remote(client) => client
+                .reboot_linux(request)
+                .map(Json)
+                .map_err(|e| e.to_string()),
         }
-        let board = self
-            .registry
-            .board(&request.board_id)
-            .map_err(|e| e.to_string())?;
-        let states = request
-            .wait_for
-            .map(|value| vec![value.board_state()])
-            .unwrap_or_else(|| {
-                vec![
-                    BoardState::UbootCountdown,
-                    BoardState::LinuxBooting,
-                    BoardState::LinuxLogin,
-                ]
-            });
-        Ok(Json(
-            self.registry
-                .simple_console_operation(
-                    &request.board_id,
-                    "reboot_linux",
-                    b"reboot\r",
-                    &states,
-                    std::time::Duration::from_millis(
-                        request
-                            .timeout_ms
-                            .unwrap_or(board.profile.timing.operation_timeout_ms),
-                    ),
-                    true,
-                )
-                .map_err(|e| e.to_string())?,
-        ))
     }
-}
-
-fn state_string(state: BoardState) -> String {
-    serde_json::to_value(state)
-        .unwrap_or_default()
-        .as_str()
-        .unwrap_or("unknown")
-        .into()
-}
-fn parse_states(values: &[String]) -> Result<Vec<BoardState>, String> {
-    values
-        .iter()
-        .map(|value| match value.as_str() {
-            "uboot" | "uboot_prompt" => Ok(BoardState::UbootPrompt),
-            "uboot_countdown" => Ok(BoardState::UbootCountdown),
-            "linux_booting" => Ok(BoardState::LinuxBooting),
-            "linux_login" => Ok(BoardState::LinuxLogin),
-            "linux_shell" => Ok(BoardState::LinuxShell),
-            "shutdown_in_progress" => Ok(BoardState::ShutdownInProgress),
-            _ => Err(format!("unknown state {value:?}")),
-        })
-        .collect()
 }
 
 #[tool_handler(router = self.tool_router)]

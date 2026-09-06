@@ -522,6 +522,8 @@ The implemented initial release has demonstrated:
     exclusive.
 14. Detecting U-Boot, Linux login, and Linux shell states after server restart
     using the disclosed Enter-based active probe.
+15. Supporting concurrent MCP servers from multiple AI agents (e.g. Codex, AGY)
+    via background daemon service or auto-connecting client proxy over Unix domain socket.
 
 MCP resources, task/cancellation support, persistent audit storage, automatic
 unknown-state recovery, and richer transcript separation remain post-v0.1 work.
@@ -529,7 +531,7 @@ unknown-state recovery, and richer transcript separation remain post-v0.1 work.
 ## 20. Delivery status
 
 1. Complete: profiles, board registry, serial ownership, capture, state
-   detection, active probing, and real-time Unix-socket monitoring.
+   detection, active probing, real-time Unix-socket monitoring, and multi-agent daemon/client IPC.
 2. Complete: verified Matter on/off/cycle operations, atomic power-on-to-U-Boot
    and power-on-to-Linux flows, and graceful shutdown.
 3. Complete: U-Boot synchronization, atomic reboot/reset-to-U-Boot, and

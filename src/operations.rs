@@ -4,19 +4,26 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmcp::schemars;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::lease::LeaseOwner;
+use crate::mcp::{
+    BoardRequest, BoardStateRequest, BoardStateResult, BoardSummary, BootLinuxRequest,
+    CaptureSerialRequest, CommandRequest, EnterUbootRequest, LinuxLoginRequest, PowerOffRequest,
+    PowerOnLinuxRequest, PowerOnRequest, PowerOnUbootRequest, PowerCycleRequest, PowerStateResult,
+    RebootLinuxRequest, SerialCaptureResult, WaitStateRequest,
+};
 use crate::policy::validate_one_line;
 use crate::state::{BoardState, StateDetector};
 use crate::{BoardRegistry, Error, ErrorCode, Result};
 
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OperationResult {
     pub operation_id: String,
     pub board_id: String,
     pub operation: String,
+
     pub success: bool,
     pub started_ms: u64,
     pub finished_ms: u64,
@@ -28,7 +35,7 @@ pub struct OperationResult {
     pub policy_decision: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PowerObservation {
     pub state: String,
     pub identity_verified: bool,
@@ -699,4 +706,361 @@ impl BoardRegistry {
             result
         })
     }
+
+    pub fn list_board_summaries(&self) -> Vec<BoardSummary> {
+        self.list()
+            .into_iter()
+            .map(|board| {
+                let owner = board.lease.owner();
+                BoardSummary {
+                    board_id: board.profile.board_id.clone(),
+                    display_name: board.profile.display_name.clone(),
+                    serial_device: board.profile.serial.device.clone(),
+                    power_backend: board.profile.power.backend.clone(),
+                    available: owner.is_none(),
+                    lease_owner_operation_id: owner.map(|value| value.operation_id),
+                }
+            })
+            .collect()
+    }
+
+    pub fn board_state(&self, req: &BoardStateRequest) -> Result<BoardStateResult> {
+        let board = self.board(&req.board_id)?;
+        let active_probe = req.active_probe.unwrap_or(false);
+        let observe_duration =
+            Duration::from_millis(req.observe_duration_ms.unwrap_or(500).min(5_000));
+        let cursor = board
+            .serial
+            .lock()
+            .map_err(|_| Error::new(ErrorCode::SerialDisconnected, "state", "serial buffer lock poisoned"))?
+            .next_cursor();
+        if active_probe {
+            self.write_console(&req.board_id, b"\r")?;
+        }
+        thread::sleep(observe_duration);
+        let serial = board
+            .serial
+            .lock()
+            .map_err(|_| Error::new(ErrorCode::SerialDisconnected, "state", "serial buffer lock poisoned"))?;
+        let snapshot = if active_probe {
+            serial.snapshot_from(cursor, 65_536)
+        } else {
+            serial.snapshot_generation(serial.generation(), 65_536)
+        };
+        let bytes: Vec<u8> = snapshot
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.bytes.iter().copied())
+            .collect();
+        let mut evidence = StateDetector::new(&board.profile.patterns).observe(
+            &bytes,
+            SystemTime::now(),
+            serial.generation(),
+        );
+        evidence.active_probe = active_probe;
+        Ok(BoardStateResult {
+            board_id: req.board_id.clone(),
+            state: serde_json::to_value(evidence.state)
+                .unwrap_or_default()
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string(),
+            confidence: evidence.confidence,
+            timestamp_ms: evidence
+                .timestamp
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            console_generation: evidence.generation,
+            evidence: String::from_utf8_lossy(&evidence.evidence).into_owned(),
+            active_probe: evidence.active_probe,
+        })
+    }
+
+    pub fn board_power_state(&self, req: &BoardRequest) -> Result<PowerStateResult> {
+        let board = self.board(&req.board_id)?;
+        let observation = self.power_state(&req.board_id)?;
+        Ok(PowerStateResult {
+            board_id: req.board_id.clone(),
+            state: observation.state,
+            backend: board.profile.power.backend.clone(),
+            configured_identity: board.profile.power.identity.clone(),
+            identity_verified: observation.identity_verified,
+            detail: observation.raw,
+        })
+    }
+
+    pub fn capture_board_serial(&self, req: &CaptureSerialRequest) -> Result<SerialCaptureResult> {
+        let board = self.board(&req.board_id)?;
+        let serial = board
+            .serial
+            .lock()
+            .map_err(|_| Error::new(ErrorCode::SerialDisconnected, "capture", "serial buffer lock poisoned"))?;
+        let max_bytes = req.max_bytes.unwrap_or(65_536).clamp(1, 1_048_576);
+        let start_cursor = req
+            .cursor
+            .unwrap_or_else(|| serial.next_cursor().saturating_sub(max_bytes as u64));
+        let snapshot = serial.snapshot_from(start_cursor, max_bytes);
+        let bytes: Vec<u8> = snapshot
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.bytes.iter().copied())
+            .collect();
+        let invalid_utf8 = std::str::from_utf8(&bytes).is_err();
+        Ok(SerialCaptureResult {
+            board_id: req.board_id.clone(),
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            start_cursor,
+            next_cursor: snapshot.next_cursor,
+            console_generation: serial.generation(),
+            truncated: snapshot.truncated,
+            invalid_utf8,
+        })
+    }
+
+    pub fn power_on_board(&self, req: &PowerOnRequest) -> Result<OperationResult> {
+        let result = self.power_on(&req.board_id)?;
+        if let Some(wait) = req.wait_for.as_deref().filter(|v| *v != "none") {
+            let states = parse_states(&[wait.to_string()])?;
+            self.wait_for_states(
+                &req.board_id,
+                &states,
+                self.board(&req.board_id)?.profile.operation_timeout(),
+                None,
+            )?;
+        }
+        Ok(result)
+    }
+
+    pub fn power_on_uboot_board(&self, req: &PowerOnUbootRequest) -> Result<OperationResult> {
+        let board = self.board(&req.board_id)?;
+        self.power_on_uboot(
+            &req.board_id,
+            Duration::from_millis(
+                req.timeout_ms
+                    .unwrap_or(board.profile.timing.operation_timeout_ms),
+            ),
+        )
+    }
+
+    pub fn power_on_linux_board(&self, req: &PowerOnLinuxRequest) -> Result<OperationResult> {
+        let board = self.board(&req.board_id)?;
+        self.power_on_linux(
+            &req.board_id,
+            req.login.unwrap_or(false),
+            Duration::from_millis(
+                req.timeout_ms
+                    .unwrap_or(board.profile.timing.operation_timeout_ms),
+            ),
+        )
+    }
+
+    pub fn power_off_board(&self, req: &PowerOffRequest) -> Result<OperationResult> {
+        if req.reason.trim().is_empty() {
+            return Err(Error::new(ErrorCode::InvalidConfiguration, "power_off", "reason is required"));
+        }
+        match req.mode.as_str() {
+            "graceful" => self.graceful_power_off(&req.board_id, req.confirmation),
+            "force" => self.forced_power_off(&req.board_id, req.confirmation),
+            _ => Err(Error::new(ErrorCode::InvalidConfiguration, "power_off", "mode must be graceful or force")),
+        }
+    }
+
+    pub fn power_cycle_board(&self, req: &PowerCycleRequest) -> Result<OperationResult> {
+        if req.reason.trim().is_empty() {
+            return Err(Error::new(ErrorCode::InvalidConfiguration, "power_cycle", "reason is required"));
+        }
+        if !matches!(req.mode.as_str(), "graceful" | "force") {
+            return Err(Error::new(ErrorCode::InvalidConfiguration, "power_cycle", "mode must be graceful or force"));
+        }
+        self.power_cycle(&req.board_id, req.confirmation)
+    }
+
+    pub fn wait_for_board_state(&self, req: &WaitStateRequest) -> Result<BoardStateResult> {
+        let states = parse_states(&req.states)?;
+        let state = self.wait_for_states(
+            &req.board_id,
+            &states,
+            Duration::from_millis(req.timeout_ms),
+            None,
+        )?;
+        Ok(BoardStateResult {
+            board_id: req.board_id.clone(),
+            state: state_name(state),
+            confidence: 0.95,
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            console_generation: 0,
+            evidence: "matched current console generation".into(),
+            active_probe: false,
+        })
+    }
+
+    pub fn enter_board_uboot(&self, req: &EnterUbootRequest) -> Result<OperationResult> {
+        let state = self.observed_state(&req.board_id)?;
+        if !matches!(req.restart.as_str(), "auto" | "always" | "never") {
+            return Err(Error::new(ErrorCode::InvalidConfiguration, "enter_uboot", "restart must be auto, always, or never"));
+        }
+        if state == BoardState::UbootPrompt {
+            if req.restart == "always" {
+                let timeout = self.board(&req.board_id)?.profile.operation_timeout();
+                return self.reset_into_uboot(&req.board_id, timeout);
+            }
+            return self.simple_console_operation(
+                &req.board_id,
+                "enter_uboot",
+                b"\r",
+                &[BoardState::UbootPrompt],
+                Duration::from_secs(2),
+                false,
+            );
+        }
+        if state == BoardState::UbootCountdown {
+            let interrupt = self.board(&req.board_id)?.profile.uboot.interrupt.clone();
+            return self.simple_console_operation(
+                &req.board_id,
+                "enter_uboot",
+                interrupt.as_bytes(),
+                &[BoardState::UbootPrompt],
+                Duration::from_secs(10),
+                false,
+            );
+        }
+        if req.restart == "never" {
+            return Err(Error::new(ErrorCode::UbootPromptNotFound, "enter_uboot", "U-Boot is not active and restart=never"));
+        }
+        if state == BoardState::LinuxShell {
+            let timeout = self.board(&req.board_id)?.profile.operation_timeout();
+            return self.reboot_into_uboot(&req.board_id, timeout);
+        }
+        Err(Error::new(ErrorCode::ShellNotSynchronized, "enter_uboot", "automatic restart requires a known Linux shell or U-Boot prompt"))
+    }
+
+    pub fn run_board_uboot_command(&self, req: &CommandRequest) -> Result<OperationResult> {
+        self.console_command(
+            &req.board_id,
+            "run_uboot_command",
+            &req.command,
+            false,
+            Duration::from_millis(req.timeout_ms),
+        )
+    }
+
+    pub fn boot_board_linux(&self, req: &BootLinuxRequest) -> Result<OperationResult> {
+        let board = self.board(&req.board_id)?;
+        let command = format!("{}\r", board.profile.uboot.boot_command);
+        let states = if req.login.unwrap_or(false) {
+            vec![BoardState::LinuxLogin, BoardState::LinuxShell]
+        } else {
+            vec![
+                BoardState::LinuxBooting,
+                BoardState::LinuxLogin,
+                BoardState::LinuxShell,
+            ]
+        };
+        self.simple_console_operation(
+            &req.board_id,
+            "boot_linux",
+            command.as_bytes(),
+            &states,
+            Duration::from_millis(
+                req.timeout_ms
+                    .unwrap_or(board.profile.timing.operation_timeout_ms),
+            ),
+            false,
+        )
+    }
+
+    pub fn linux_board_login(&self, req: &LinuxLoginRequest) -> Result<OperationResult> {
+        let board = self.board(&req.board_id)?;
+        let configured = board
+            .profile
+            .linux
+            .account
+            .as_deref()
+            .ok_or_else(|| Error::new(ErrorCode::InvalidConfiguration, "linux_login", "Linux account is not configured"))?;
+        if req
+            .account
+            .as_deref()
+            .is_some_and(|value| value != configured)
+        {
+            return Err(Error::new(ErrorCode::InvalidConfiguration, "linux_login", "requested account is not configured"));
+        }
+        let line = format!("{configured}\r");
+        self.simple_console_operation(
+            &req.board_id,
+            "linux_login",
+            line.as_bytes(),
+            &[BoardState::LinuxShell],
+            Duration::from_millis(
+                req.timeout_ms
+                    .unwrap_or(board.profile.timing.operation_timeout_ms),
+            ),
+            false,
+        )
+    }
+
+    pub fn run_board_linux_command(&self, req: &CommandRequest) -> Result<OperationResult> {
+        self.console_command(
+            &req.board_id,
+            "run_linux_command",
+            &req.command,
+            true,
+            Duration::from_millis(req.timeout_ms),
+        )
+    }
+
+    pub fn reboot_board_linux(&self, req: &RebootLinuxRequest) -> Result<OperationResult> {
+        if !req.confirmation {
+            return Err(Error::new(
+                ErrorCode::ConfirmationRequired,
+                "reboot_linux",
+                "reboot requires confirmation=true",
+            ));
+        }
+        let board = self.board(&req.board_id)?;
+        let states = req
+            .wait_for
+            .map(|value| vec![value.board_state()])
+            .unwrap_or_else(|| {
+                vec![
+                    BoardState::UbootCountdown,
+                    BoardState::LinuxBooting,
+                    BoardState::LinuxLogin,
+                ]
+            });
+        self.simple_console_operation(
+            &req.board_id,
+            "reboot_linux",
+            b"reboot\r",
+            &states,
+            Duration::from_millis(
+                req.timeout_ms
+                    .unwrap_or(board.profile.timing.operation_timeout_ms),
+            ),
+            true,
+        )
+    }
 }
+
+pub fn parse_states(values: &[String]) -> Result<Vec<BoardState>> {
+    values
+        .iter()
+        .map(|value| match value.as_str() {
+            "uboot" | "uboot_prompt" => Ok(BoardState::UbootPrompt),
+            "uboot_countdown" => Ok(BoardState::UbootCountdown),
+            "linux_booting" => Ok(BoardState::LinuxBooting),
+            "linux_login" => Ok(BoardState::LinuxLogin),
+            "linux_shell" => Ok(BoardState::LinuxShell),
+            "shutdown_in_progress" => Ok(BoardState::ShutdownInProgress),
+            _ => Err(Error::new(
+                ErrorCode::InvalidConfiguration,
+                "parse_states",
+                format!("unknown state {value:?}"),
+            )),
+        })
+        .collect()
+}
+

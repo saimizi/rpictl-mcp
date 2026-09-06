@@ -1,3 +1,4 @@
+pub mod client;
 pub mod config;
 pub mod console;
 pub mod error;
@@ -10,6 +11,9 @@ pub mod registry;
 pub mod serial;
 pub mod state;
 
+pub use client::{SocketClient, ping_daemon};
 pub use config::{BoardProfile, Config};
 pub use error::{Error, ErrorCode, Result};
+pub use mcp::ServerBackend;
 pub use registry::BoardRegistry;
+
