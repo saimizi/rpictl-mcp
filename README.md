@@ -236,6 +236,38 @@ In `claude_desktop_config.json` or `.codex/mcp.json`:
 
 ---
 
+## Tests
+
+Run the test suite with `cargo test`. On Linux, the `power_on_uboot` integration
+tests launch the real daemon with an isolated pseudo-terminal and a fake
+`chip-tool` placed only on that child process's PATH. They require no hardware
+or new Rust dependencies.
+
+The simulated relay withholds confirmation until the test permits it. This
+checks that the daemon interrupts a fresh U-Boot countdown while power-on is
+still pending, holds the board lease until verification finishes, propagates a
+power-verification failure even after reaching the prompt, and joins the power
+worker on a countdown timeout.
+
+`power_on_uboot` arms fresh serial capture before applying power and observes
+U-Boot while relay verification runs in a scoped worker. Success requires both
+the fresh U-Boot prompt and verified relay power.
+
+Power queries and changes enforce the board's `operation_timeout_ms`. A power
+change shares one deadline across its initial query, relay command, and final
+verification. Timed-out commands are terminated and reaped before the board
+lease is released; the operation reports `COMMAND_TIMEOUT`. Combined stdout and
+stderr capture is limited to 1 MiB per external command. Exceeding this limit
+terminates the process group, reaps the command, and returns `OUTPUT_TRUNCATED`.
+Capture uses nonblocking pipes, with no temporary output files or detached readers.
+
+If fresh serial output already contains a U-Boot prompt when the countdown is
+checked, the operation sends Enter and requires a new prompt to synchronize.
+It reports that the prompt was already reached rather than claiming that it
+interrupted the countdown. Prompts from before power-on cannot satisfy this wait.
+
+---
+
 ## License
 
 Apache-2.0 / MIT

@@ -1,5 +1,7 @@
-use std::io::Write;
-use std::process::Command;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,6 +58,135 @@ fn state_name(state: BoardState) -> String {
         .into()
 }
 
+const MAX_POWER_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+    // SAFETY: the descriptor is owned by a live child pipe. Preserve its flags.
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+// Read at most one chunk per stream per iteration, so a noisy stream cannot
+// starve the other stream or delay timeout checks. Never retain excess bytes.
+fn collect_power_output(
+    pipe: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    remaining: &mut usize,
+    phase: &'static str,
+) -> Result<bool> {
+    let mut buffer = [0_u8; 8192];
+    match pipe.read(&mut buffer) {
+        Ok(0) => Ok(true),
+        Ok(count) => {
+            if count > *remaining {
+                return Err(Error::new(
+                    ErrorCode::OutputTruncated,
+                    phase,
+                    format!(
+                        "power command exceeded combined stdout/stderr limit of {MAX_POWER_OUTPUT_BYTES} bytes"
+                    ),
+                ));
+            }
+            bytes.reserve_exact(count);
+            bytes.extend_from_slice(&buffer[..count]);
+            *remaining -= count;
+            Ok(false)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(Error::new(
+            ErrorCode::PowerBackendFailed,
+            phase,
+            error.to_string(),
+        )),
+    }
+}
+
+fn run_power_command(
+    command: &mut Command,
+    deadline: Instant,
+    phase: &'static str,
+) -> Result<Output> {
+    let failed =
+        |error: std::io::Error| Error::new(ErrorCode::PowerBackendFailed, phase, error.to_string());
+    if Instant::now() >= deadline {
+        return Err(Error::new(
+            ErrorCode::CommandTimeout,
+            phase,
+            "power command deadline expired before launch",
+        ));
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(failed)?;
+    let result = (|| {
+        let mut stdout_pipe = child.stdout.take().unwrap();
+        let mut stderr_pipe = child.stderr.take().unwrap();
+        nonblocking(&stdout_pipe).map_err(failed)?;
+        nonblocking(&stderr_pipe).map_err(failed)?;
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let (mut stdout_eof, mut stderr_eof) = (false, false);
+        let mut remaining = MAX_POWER_OUTPUT_BYTES;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Error::new(
+                    ErrorCode::CommandTimeout,
+                    phase,
+                    "power command deadline expired; subprocess terminated and reaped",
+                ));
+            }
+            let previous = remaining;
+            if !stdout_eof {
+                stdout_eof =
+                    collect_power_output(&mut stdout_pipe, &mut stdout, &mut remaining, phase)?;
+            }
+            if !stderr_eof {
+                stderr_eof =
+                    collect_power_output(&mut stderr_pipe, &mut stderr, &mut remaining, phase)?;
+            }
+            // Keep the leader unreaped until both pipes close. If descendants
+            // retain the pipes, the deadline still kills the original group
+            // without risking reuse of its PID/process-group ID.
+            if stdout_eof && stderr_eof {
+                if let Some(status) = child.try_wait().map_err(failed)? {
+                    return Ok(Output {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+            }
+            if remaining == previous {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    })();
+    if result.is_err() {
+        // SAFETY: the group was created for this still-unreaped child.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        child.wait().map_err(failed)?;
+    }
+    result
+}
+
 fn parse_identity(identity: &str) -> Result<(String, String, Option<String>)> {
     let mut node = None;
     let mut endpoint = None;
@@ -88,6 +219,11 @@ fn parse_identity(identity: &str) -> Result<(String, String, Option<String>)> {
 
 impl BoardRegistry {
     pub fn power_state(&self, board_id: &str) -> Result<PowerObservation> {
+        let deadline = Instant::now() + self.board(board_id)?.profile.operation_timeout();
+        self.power_state_until(board_id, deadline)
+    }
+
+    fn power_state_until(&self, board_id: &str, deadline: Instant) -> Result<PowerObservation> {
         let board = self.board(board_id)?;
         if board.profile.power.backend != "matter" {
             return Err(Error::new(
@@ -97,16 +233,11 @@ impl BoardRegistry {
             ));
         }
         let (node, endpoint, mac) = parse_identity(&board.profile.power.identity)?;
-        let output = Command::new("chip-tool")
-            .args(["onoff", "read", "on-off", &node, &endpoint])
-            .output()
-            .map_err(|error| {
-                Error::new(
-                    ErrorCode::PowerBackendFailed,
-                    "power_query",
-                    error.to_string(),
-                )
-            })?;
+        let output = run_power_command(
+            Command::new("chip-tool").args(["onoff", "read", "on-off", &node, &endpoint]),
+            deadline,
+            "power_query",
+        )?;
         let raw = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -127,16 +258,15 @@ impl BoardRegistry {
             "unknown"
         };
         let identity_verified = if let Some(mac) = mac {
-            Command::new("ip")
-                .arg("neigh")
-                .output()
-                .ok()
-                .map(|value| {
-                    String::from_utf8_lossy(&value.stdout)
-                        .to_ascii_lowercase()
-                        .contains(&mac)
-                })
-                .unwrap_or(false)
+            let neighbors = run_power_command(
+                Command::new("ip").arg("neigh"),
+                deadline,
+                "power_identity",
+            )?;
+            neighbors.status.success()
+                && String::from_utf8_lossy(&neighbors.stdout)
+                    .to_ascii_lowercase()
+                    .contains(&mac)
         } else {
             true
         };
@@ -149,7 +279,8 @@ impl BoardRegistry {
 
     fn set_power(&self, board_id: &str, on: bool) -> Result<PowerObservation> {
         let board = self.board(board_id)?;
-        let before = self.power_state(board_id)?;
+        let deadline = Instant::now() + board.profile.operation_timeout();
+        let before = self.power_state_until(board_id, deadline)?;
         if !before.identity_verified {
             return Err(Error::new(
                 ErrorCode::PowerIdentityMismatch,
@@ -159,16 +290,11 @@ impl BoardRegistry {
         }
         let (node, endpoint, _) = parse_identity(&board.profile.power.identity)?;
         let action = if on { "on" } else { "off" };
-        let output = Command::new("chip-tool")
-            .args(["onoff", action, &node, &endpoint])
-            .output()
-            .map_err(|error| {
-                Error::new(
-                    ErrorCode::PowerBackendFailed,
-                    "power_change",
-                    error.to_string(),
-                )
-            })?;
+        let output = run_power_command(
+            Command::new("chip-tool").args(["onoff", action, &node, &endpoint]),
+            deadline,
+            "power_change",
+        )?;
         let raw = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -181,7 +307,7 @@ impl BoardRegistry {
                 raw,
             ));
         }
-        let after = self.power_state(board_id)?;
+        let after = self.power_state_until(board_id, deadline)?;
         let expected = if on { "on" } else { "off" };
         if after.state != expected {
             return Err(Error::new(
@@ -300,8 +426,20 @@ impl BoardRegistry {
         timeout: Duration,
         cursor: u64,
     ) -> Result<BoardState> {
+        self.wait_for_states_after_checked(board_id, states, timeout, cursor, || Ok(()))
+    }
+
+    fn wait_for_states_after_checked(
+        &self,
+        board_id: &str,
+        states: &[BoardState],
+        timeout: Duration,
+        cursor: u64,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<BoardState> {
         let deadline = Instant::now() + timeout;
         loop {
+            check()?;
             let board = self.board(board_id)?;
             let serial = board.serial.lock().map_err(|_| {
                 Error::new(
@@ -400,28 +538,74 @@ impl BoardRegistry {
                         "board is already powered on; use enter_uboot instead",
                     ));
                 }
-                self.set_power(board_id, true)?;
                 let board = self.board(board_id)?;
+                // Arm countdown capture before applying power. Relay verification
+                // may take longer than the firmware's autoboot window.
                 board.serial.lock().unwrap().mark_generation();
                 let countdown_cursor = board.serial.lock().unwrap().next_cursor();
-                actions.push("verified relay on".into());
-                self.wait_for_states_after(
-                    board_id,
-                    &[BoardState::UbootCountdown],
-                    timeout,
-                    countdown_cursor,
-                )?;
-
-                let prompt_cursor = board.serial.lock().unwrap().next_cursor();
-                self.write_console(board_id, board.profile.uboot.interrupt.as_bytes())?;
-                actions.push("interrupted the fresh U-Boot autoboot countdown".into());
-                let state = self.wait_for_states_after(
-                    board_id,
-                    &[BoardState::UbootPrompt],
-                    Duration::from_secs(10),
-                    prompt_cursor,
-                )?;
-                Ok(format!("observed {}", state_name(state)))
+                thread::scope(|scope| {
+                    let mut power = Some(scope.spawn(|| self.set_power(board_id, true)));
+                    let join_power = |worker: thread::ScopedJoinHandle<'_, Result<PowerObservation>>| {
+                        worker.join().map_err(|_| {
+                            Error::new(
+                                ErrorCode::PowerBackendFailed,
+                                "power_on_uboot",
+                                "power worker panicked",
+                            )
+                        })??;
+                        Ok(())
+                    };
+                    let mut check_power = || {
+                        if power.as_ref().is_some_and(|worker| worker.is_finished()) {
+                            join_power(power.take().unwrap())?;
+                        }
+                        Ok(())
+                    };
+                    let boot = (|| {
+                        let initial = self.wait_for_states_after_checked(
+                            board_id,
+                            &[BoardState::UbootCountdown, BoardState::UbootPrompt],
+                            timeout,
+                            countdown_cursor,
+                            &mut check_power,
+                        )?;
+                        if initial == BoardState::UbootPrompt {
+                            // A fresh prompt superseded the countdown before we
+                            // could interrupt it. Synchronize it without claiming
+                            // that an interrupt was sent or succeeded.
+                            let cursor = board.serial.lock().unwrap().next_cursor();
+                            self.write_console(board_id, b"\r")?;
+                            actions.push(
+                                "fresh U-Boot prompt already reached; sent Enter to synchronize".into(),
+                            );
+                            return self.wait_for_states_after_checked(
+                                board_id,
+                                &[BoardState::UbootPrompt],
+                                Duration::from_secs(10),
+                                cursor,
+                                &mut check_power,
+                            );
+                        }
+                        let prompt_cursor = board.serial.lock().unwrap().next_cursor();
+                        self.write_console(board_id, board.profile.uboot.interrupt.as_bytes())?;
+                        actions.push("interrupted the fresh U-Boot autoboot countdown".into());
+                        self.wait_for_states_after_checked(
+                            board_id,
+                            &[BoardState::UbootPrompt],
+                            Duration::from_secs(10),
+                            prompt_cursor,
+                            &mut check_power,
+                        )
+                    })();
+                    // Join even after a boot error: verification and its worker
+                    // must finish before this operation releases the board lease.
+                    if let Some(worker) = power {
+                        join_power(worker)?;
+                    }
+                    actions.push("verified relay on".into());
+                    let state = boot?;
+                    Ok(format!("observed {}", state_name(state)))
+                })
             },
         )
     }
