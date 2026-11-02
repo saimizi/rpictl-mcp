@@ -300,8 +300,20 @@ impl BoardRegistry {
         timeout: Duration,
         cursor: u64,
     ) -> Result<BoardState> {
+        self.wait_for_states_after_checked(board_id, states, timeout, cursor, || Ok(()))
+    }
+
+    fn wait_for_states_after_checked(
+        &self,
+        board_id: &str,
+        states: &[BoardState],
+        timeout: Duration,
+        cursor: u64,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<BoardState> {
         let deadline = Instant::now() + timeout;
         loop {
+            check()?;
             let board = self.board(board_id)?;
             let serial = board.serial.lock().map_err(|_| {
                 Error::new(
@@ -400,28 +412,57 @@ impl BoardRegistry {
                         "board is already powered on; use enter_uboot instead",
                     ));
                 }
-                self.set_power(board_id, true)?;
                 let board = self.board(board_id)?;
+                // Arm countdown capture before applying power. Relay verification
+                // may take longer than the firmware's autoboot window.
                 board.serial.lock().unwrap().mark_generation();
                 let countdown_cursor = board.serial.lock().unwrap().next_cursor();
-                actions.push("verified relay on".into());
-                self.wait_for_states_after(
-                    board_id,
-                    &[BoardState::UbootCountdown],
-                    timeout,
-                    countdown_cursor,
-                )?;
-
-                let prompt_cursor = board.serial.lock().unwrap().next_cursor();
-                self.write_console(board_id, board.profile.uboot.interrupt.as_bytes())?;
-                actions.push("interrupted the fresh U-Boot autoboot countdown".into());
-                let state = self.wait_for_states_after(
-                    board_id,
-                    &[BoardState::UbootPrompt],
-                    Duration::from_secs(10),
-                    prompt_cursor,
-                )?;
-                Ok(format!("observed {}", state_name(state)))
+                thread::scope(|scope| {
+                    let mut power = Some(scope.spawn(|| self.set_power(board_id, true)));
+                    let join_power = |worker: thread::ScopedJoinHandle<'_, Result<PowerObservation>>| {
+                        worker.join().map_err(|_| {
+                            Error::new(
+                                ErrorCode::PowerBackendFailed,
+                                "power_on_uboot",
+                                "power worker panicked",
+                            )
+                        })??;
+                        Ok(())
+                    };
+                    let mut check_power = || {
+                        if power.as_ref().is_some_and(|worker| worker.is_finished()) {
+                            join_power(power.take().unwrap())?;
+                        }
+                        Ok(())
+                    };
+                    let boot = (|| {
+                        self.wait_for_states_after_checked(
+                            board_id,
+                            &[BoardState::UbootCountdown],
+                            timeout,
+                            countdown_cursor,
+                            &mut check_power,
+                        )?;
+                        let prompt_cursor = board.serial.lock().unwrap().next_cursor();
+                        self.write_console(board_id, board.profile.uboot.interrupt.as_bytes())?;
+                        actions.push("interrupted the fresh U-Boot autoboot countdown".into());
+                        self.wait_for_states_after_checked(
+                            board_id,
+                            &[BoardState::UbootPrompt],
+                            Duration::from_secs(10),
+                            prompt_cursor,
+                            &mut check_power,
+                        )
+                    })();
+                    // Join even after a boot error: verification and its worker
+                    // must finish before this operation releases the board lease.
+                    if let Some(worker) = power {
+                        join_power(worker)?;
+                    }
+                    actions.push("verified relay on".into());
+                    let state = boot?;
+                    Ok(format!("observed {}", state_name(state)))
+                })
             },
         )
     }
