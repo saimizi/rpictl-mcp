@@ -1,6 +1,5 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -59,30 +58,68 @@ fn state_name(state: BoardState) -> String {
         .into()
 }
 
-// Unlinked files avoid pipe backpressure and pipe readers that can remain blocked
-// when a hung command leaves descendants holding stdout/stderr open.
-fn power_output_file() -> std::io::Result<File> {
-    let path = std::env::temp_dir().join(format!("rpictl-power-{}", Uuid::new_v4()));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    std::fs::remove_file(path)?;
-    Ok(file)
+const MAX_POWER_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+    // SAFETY: the descriptor is owned by a live child pipe. Preserve its flags.
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
-fn run_power_command(command: &mut Command, deadline: Instant, phase: &'static str) -> Result<Output> {
+// Read at most one chunk per stream per iteration, so a noisy stream cannot
+// starve the other stream or delay timeout checks. Never retain excess bytes.
+fn collect_power_output(
+    pipe: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    remaining: &mut usize,
+    phase: &'static str,
+) -> Result<bool> {
+    let mut buffer = [0_u8; 8192];
+    match pipe.read(&mut buffer) {
+        Ok(0) => Ok(true),
+        Ok(count) => {
+            if count > *remaining {
+                return Err(Error::new(
+                    ErrorCode::OutputTruncated,
+                    phase,
+                    format!(
+                        "power command exceeded combined stdout/stderr limit of {MAX_POWER_OUTPUT_BYTES} bytes"
+                    ),
+                ));
+            }
+            bytes.reserve_exact(count);
+            bytes.extend_from_slice(&buffer[..count]);
+            *remaining -= count;
+            Ok(false)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(Error::new(
+            ErrorCode::PowerBackendFailed,
+            phase,
+            error.to_string(),
+        )),
+    }
+}
+
+fn run_power_command(
+    command: &mut Command,
+    deadline: Instant,
+    phase: &'static str,
+) -> Result<Output> {
     let failed =
         |error: std::io::Error| Error::new(ErrorCode::PowerBackendFailed, phase, error.to_string());
-    let timed_out = || {
-        Error::new(
-            ErrorCode::CommandTimeout,
-            phase,
-            "power command deadline expired; subprocess terminated and reaped",
-        )
-    };
     if Instant::now() >= deadline {
         return Err(Error::new(
             ErrorCode::CommandTimeout,
@@ -90,47 +127,64 @@ fn run_power_command(command: &mut Command, deadline: Instant, phase: &'static s
             "power command deadline expired before launch",
         ));
     }
-    let mut stdout = power_output_file().map_err(failed)?;
-    let mut stderr = power_output_file().map_err(failed)?;
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(stdout.try_clone().map_err(failed)?)
-        .stderr(stderr.try_clone().map_err(failed)?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .map_err(failed)?;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            result => {
-                if result.is_err() || Instant::now() >= deadline {
-                    // The child is still unreaped, so its PID/process-group ID
-                    // cannot be reused. Kill descendants as well as the wrapper.
-                    unsafe {
-                        libc::kill(-(child.id() as i32), libc::SIGKILL);
-                    }
-                    let _ = child.kill();
-                    child.wait().map_err(failed)?;
-                    return match result {
-                        Err(error) => Err(failed(error)),
-                        _ => Err(timed_out()),
-                    };
+    let result = (|| {
+        let mut stdout_pipe = child.stdout.take().unwrap();
+        let mut stderr_pipe = child.stderr.take().unwrap();
+        nonblocking(&stdout_pipe).map_err(failed)?;
+        nonblocking(&stderr_pipe).map_err(failed)?;
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let (mut stdout_eof, mut stderr_eof) = (false, false);
+        let mut remaining = MAX_POWER_OUTPUT_BYTES;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Error::new(
+                    ErrorCode::CommandTimeout,
+                    phase,
+                    "power command deadline expired; subprocess terminated and reaped",
+                ));
+            }
+            let previous = remaining;
+            if !stdout_eof {
+                stdout_eof =
+                    collect_power_output(&mut stdout_pipe, &mut stdout, &mut remaining, phase)?;
+            }
+            if !stderr_eof {
+                stderr_eof =
+                    collect_power_output(&mut stderr_pipe, &mut stderr, &mut remaining, phase)?;
+            }
+            // Keep the leader unreaped until both pipes close. If descendants
+            // retain the pipes, the deadline still kills the original group
+            // without risking reuse of its PID/process-group ID.
+            if stdout_eof && stderr_eof {
+                if let Some(status) = child.try_wait().map_err(failed)? {
+                    return Ok(Output {
+                        status,
+                        stdout,
+                        stderr,
+                    });
                 }
             }
+            if remaining == previous {
+                thread::sleep(Duration::from_millis(10));
+            }
         }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let read_output = |file: &mut File| -> Result<Vec<u8>> {
-        file.seek(SeekFrom::Start(0)).map_err(failed)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(failed)?;
-        Ok(bytes)
-    };
-    Ok(Output {
-        status,
-        stdout: read_output(&mut stdout)?,
-        stderr: read_output(&mut stderr)?,
-    })
+    })();
+    if result.is_err() {
+        // SAFETY: the group was created for this still-unreaped child.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        child.wait().map_err(failed)?;
+    }
+    result
 }
 
 fn parse_identity(identity: &str) -> Result<(String, String, Option<String>)> {

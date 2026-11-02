@@ -256,7 +256,10 @@ the fresh U-Boot prompt and verified relay power.
 Power queries and changes enforce the board's `operation_timeout_ms`. A power
 change shares one deadline across its initial query, relay command, and final
 verification. Timed-out commands are terminated and reaped before the board
-lease is released; the operation reports `COMMAND_TIMEOUT`.
+lease is released; the operation reports `COMMAND_TIMEOUT`. Combined stdout and
+stderr capture is limited to 1 MiB per external command. Exceeding this limit
+terminates the process group, reaps the command, and returns `OUTPUT_TRUNCATED`.
+Capture uses nonblocking pipes, with no temporary output files or detached readers.
 
 If fresh serial output already contains a U-Boot prompt when the countdown is
 checked, the operation sends Enter and requires a new prompt to synchronize.

@@ -8,12 +8,18 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::{fs::PermissionsExt, net::UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+// Each fixture launches a daemon and subprocesses. Avoid host contention
+// invalidating short protocol deadlines; concurrency inside each test remains.
+static DAEMON_FIXTURE: Mutex<()> = Mutex::new(());
+
 struct Fixture {
+    _resource_guard: MutexGuard<'static, ()>,
     directory: PathBuf,
     daemon: Child,
     master: File,
@@ -53,6 +59,9 @@ impl Fixture {
     }
 
     fn with_timeout(power_fails: bool, timeout_ms: u64) -> Self {
+        let resource_guard = DAEMON_FIXTURE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let directory = std::env::temp_dir().join(format!("rpictl-boot-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
         let mut master = -1;
@@ -89,6 +98,27 @@ impl Fixture {
             &fake_power,
             r#"#!/bin/sh
 set -eu
+if [ -e "$FAKE_RELAY_DIR/hang-descendant" ]; then
+    echo $$ > "$FAKE_RELAY_DIR/hung-pid"
+    sleep 60 &
+    echo $! > "$FAKE_RELAY_DIR/inherited-pipe-pid"
+    exit 0
+fi
+if [ -e "$FAKE_RELAY_DIR/noise-$2" ]; then
+    mode=$(cat "$FAKE_RELAY_DIR/noise-$2")
+    if [ "$mode" != below ]; then
+        echo $$ > "$FAKE_RELAY_DIR/noise-pid"
+        sleep 60 &
+        echo $! > "$FAKE_RELAY_DIR/noise-descendant"
+    fi
+    case "$mode" in
+    stdout) head -c 2097152 /dev/zero ;;
+    stderr) head -c 2097152 /dev/zero >&2 ;;
+    combined) head -c 600000 /dev/zero; head -c 600000 /dev/zero >&2 ;;
+    below) head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2 ;;
+    esac
+    if [ "$mode" != below ]; then wait; fi
+fi
 if [ -e "$FAKE_RELAY_DIR/hang-$2" ] ||
    { [ "$2" = read ] && [ -e "$FAKE_RELAY_DIR/hang-verify" ] && [ "$(cat "$FAKE_RELAY_DIR/state")" = on ]; }; then
     echo $$ > "$FAKE_RELAY_DIR/hung-pid"
@@ -144,6 +174,7 @@ esac
             .spawn()
             .unwrap();
         let mut fixture = Self {
+            _resource_guard: resource_guard,
             directory,
             daemon,
             master,
@@ -344,6 +375,14 @@ fn assert_hung_command_times_out(marker: &str) {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)
     );
+    if let Ok(descendant) = fs::read_to_string(fixture.directory.join("inherited-pipe-pid")) {
+        wait_for(
+            || match fs::read_to_string(format!("/proc/{}/stat", descendant.trim())) {
+                Ok(stat) => stat.rsplit_once(") ").unwrap().1.starts_with('Z'),
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            },
+        );
+    }
     assert!(fixture.available());
     fs::remove_file(fixture.directory.join(marker)).unwrap();
     assert_eq!(
@@ -440,4 +479,89 @@ fn stale_prompt_before_power_on_does_not_satisfy_boot_wait() {
         "{response}"
     );
     assert!(fixture.available());
+}
+
+fn assert_excess_output_is_cleaned_up(command: &str, mode: &str) {
+    let fixture = Fixture::new(false);
+    let marker = fixture.directory.join(format!("noise-{command}"));
+    fs::write(&marker, mode).unwrap();
+    fixture.release();
+    let boot = fixture.start_boot(30_000);
+    wait_for(|| boot.is_finished());
+    let response = boot.join().unwrap();
+    assert_eq!(response["ok"], false, "{response}");
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("OUTPUT_TRUNCATED"), "{response}");
+    assert!(error.contains("1048576"), "{response}");
+    assert!(
+        error.len() < 512,
+        "error must not include excessive command output"
+    );
+    let pid: i32 = fs::read_to_string(fixture.directory.join("noise-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "command must be reaped before RPC completion"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    let descendant = fs::read_to_string(fixture.directory.join("noise-descendant")).unwrap();
+    wait_for(
+        || match fs::read_to_string(format!("/proc/{}/stat", descendant.trim())) {
+            Ok(stat) => stat.rsplit_once(") ").unwrap().1.starts_with('Z'),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        },
+    );
+    assert!(
+        fixture.available(),
+        "worker must finish before lease release"
+    );
+    fs::remove_file(marker).unwrap();
+    assert_eq!(
+        rpc(
+            &fixture.socket(),
+            "get_power_state",
+            json!({"board_id": "simulated"})
+        )["ok"],
+        true
+    );
+}
+
+#[test]
+fn excessive_query_stdout_is_bounded_and_reaped() {
+    assert_excess_output_is_cleaned_up("read", "stdout");
+}
+
+#[test]
+fn excessive_worker_stderr_is_bounded_and_reaped() {
+    assert_excess_output_is_cleaned_up("on", "stderr");
+}
+
+#[test]
+fn output_limit_is_shared_across_stdout_and_stderr() {
+    assert_excess_output_is_cleaned_up("on", "combined");
+}
+
+#[test]
+fn substantial_output_on_both_streams_below_limit_does_not_deadlock() {
+    let fixture = Fixture::new(false);
+    fs::write(fixture.directory.join("noise-read"), "below").unwrap();
+    let response = rpc(
+        &fixture.socket(),
+        "get_power_state",
+        json!({"board_id": "simulated"}),
+    );
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"]["state"], "off");
+}
+
+#[test]
+fn exited_leader_with_inherited_output_pipes_still_times_out_and_cleans_up() {
+    assert_hung_command_times_out("hang-descendant");
 }
