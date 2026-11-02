@@ -49,6 +49,10 @@ fn wait_for(mut ready: impl FnMut() -> bool) {
 
 impl Fixture {
     fn new(power_fails: bool) -> Self {
+        Self::with_timeout(power_fails, 30_000)
+    }
+
+    fn with_timeout(power_fails: bool, timeout_ms: u64) -> Self {
         let directory = std::env::temp_dir().join(format!("rpictl-boot-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
         let mut master = -1;
@@ -72,6 +76,7 @@ impl Fixture {
         let config = json!({"boards": [{
             "board_id": "simulated", "serial": {"device": device},
             "power": {"backend": "matter", "identity": "node=991;endpoint=1"},
+            "timing": {"operation_timeout_ms": timeout_ms},
             "patterns": {"uboot_countdown": "Hit any key", "uboot_prompt": "U-Boot>",
                 "linux_boot": "Linux version", "linux_login": "login:", "linux_shell": "root@fake:#"}
         }]});
@@ -84,6 +89,13 @@ impl Fixture {
             &fake_power,
             r#"#!/bin/sh
 set -eu
+if [ -e "$FAKE_RELAY_DIR/hang-$2" ] ||
+   { [ "$2" = read ] && [ -e "$FAKE_RELAY_DIR/hang-verify" ] && [ "$(cat "$FAKE_RELAY_DIR/state")" = on ]; }; then
+    echo $$ > "$FAKE_RELAY_DIR/hung-pid"
+    # Exceed a pipe's capacity before hanging to exercise output handling too.
+    head -c 131072 /dev/zero
+    exec sleep 60
+fi
 case "$2" in
 read)
     if [ "$(cat "$FAKE_RELAY_DIR/state")" = on ]; then
@@ -303,4 +315,129 @@ fn power_failure_returns_without_waiting_for_countdown() {
         fixture.available(),
         "failed operation must release the lease"
     );
+}
+
+fn assert_hung_command_times_out(marker: &str) {
+    let fixture = Fixture::with_timeout(false, 800);
+    fs::write(fixture.directory.join(marker), "").unwrap();
+    fixture.release();
+    let boot = fixture.start_boot(200);
+    wait_for(|| fixture.directory.join("hung-pid").exists());
+    let pid: i32 = fs::read_to_string(fixture.directory.join("hung-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_for(|| boot.is_finished());
+    let response = boot.join().unwrap();
+    assert_eq!(response["ok"], false, "{response}");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("COMMAND_TIMEOUT"),
+        "{response}"
+    );
+    // No live process or unreaped zombie may remain when the lease is released.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert!(fixture.available());
+    fs::remove_file(fixture.directory.join(marker)).unwrap();
+    assert_eq!(
+        rpc(
+            &fixture.socket(),
+            "get_power_state",
+            json!({"board_id": "simulated"})
+        )["ok"],
+        true
+    );
+}
+
+#[test]
+fn hanging_power_query_is_terminated_and_reaped() {
+    assert_hung_command_times_out("hang-read");
+}
+
+#[test]
+fn countdown_timeout_still_terminates_and_reaps_hanging_power_worker() {
+    assert_hung_command_times_out("hang-on");
+}
+
+#[test]
+fn hanging_post_power_verification_is_terminated_and_reaped() {
+    assert_hung_command_times_out("hang-verify");
+}
+
+fn check_already_reached_prompt(output: &[u8]) {
+    let mut fixture = Fixture::new(false);
+    let boot = fixture.start_boot(3000);
+    fixture.powered();
+    fixture.master.write_all(output).unwrap();
+    let mut descriptor = libc::pollfd {
+        fd: fixture.master.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut descriptor, 1, 2000) },
+        1,
+        "fresh prompt was not synchronized"
+    );
+    let mut byte = [0];
+    fixture.master.read_exact(&mut byte).unwrap();
+    assert_eq!(
+        byte,
+        [b'\r'],
+        "send Enter rather than a countdown interrupt at an existing prompt"
+    );
+    fixture.master.write_all(b"\r\nU-Boot> ").unwrap();
+    fixture.release();
+    let response = boot.join().unwrap();
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"]["observed_state"], "uboot_prompt");
+    let actions = response["result"]["actions"].to_string();
+    assert!(actions.contains("already reached"), "{response}");
+    assert!(!actions.contains("interrupted"), "{response}");
+    assert!(fixture.available());
+}
+
+#[test]
+fn combined_countdown_and_prompt_synchronizes_existing_prompt() {
+    check_already_reached_prompt(b"Hit any key to stop autoboot: 1\r\nU-Boot> ");
+}
+
+#[test]
+fn fresh_prompt_without_countdown_is_reported_as_already_reached() {
+    check_already_reached_prompt(b"\r\nU-Boot> ");
+}
+
+#[test]
+fn stale_prompt_before_power_on_does_not_satisfy_boot_wait() {
+    let mut fixture = Fixture::new(false);
+    fixture.master.write_all(b"\r\nU-Boot> ").unwrap();
+    wait_for(|| {
+        rpc(
+            &fixture.socket(),
+            "get_board_state",
+            json!({
+                "board_id": "simulated", "active_probe": false, "observe_duration_ms": 1
+            }),
+        )["result"]["state"]
+            == "uboot_prompt"
+    });
+    fixture.release();
+    let boot = fixture.start_boot(200);
+    let response = boot.join().unwrap();
+    assert_eq!(response["ok"], false, "{response}");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("STATE_TIMEOUT"),
+        "{response}"
+    );
+    assert!(fixture.available());
 }

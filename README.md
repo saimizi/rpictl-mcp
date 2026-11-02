@@ -253,6 +253,16 @@ worker on a countdown timeout.
 U-Boot while relay verification runs in a scoped worker. Success requires both
 the fresh U-Boot prompt and verified relay power.
 
+Power queries and changes enforce the board's `operation_timeout_ms`. A power
+change shares one deadline across its initial query, relay command, and final
+verification. Timed-out commands are terminated and reaped before the board
+lease is released; the operation reports `COMMAND_TIMEOUT`.
+
+If fresh serial output already contains a U-Boot prompt when the countdown is
+checked, the operation sends Enter and requires a new prompt to synchronize.
+It reports that the prompt was already reached rather than claiming that it
+interrupted the countdown. Prompts from before power-on cannot satisfy this wait.
+
 ---
 
 ## License
